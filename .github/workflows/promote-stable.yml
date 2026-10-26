@@ -43,8 +43,8 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v7
 
+      # Always, branch_only included: the check below needs the registry either way.
       - name: Log in to GHCR
-        if: ${{ !inputs.branch_only }}
         uses: docker/login-action@v4
         with:
           registry: ghcr.io
@@ -52,25 +52,37 @@ jobs:
           password: ${{ github.token }}
 
       - name: Set up Buildx
-        if: ${{ !inputs.branch_only }}
         uses: docker/setup-buildx-action@v4
 
-      # Before the CI gate and before anything is pushed, so a tag with no
-      # images is refused with the stable branch untouched.
+      # Before the CI gate and before anything is pushed, so a refused run
+      # leaves the stable branch untouched. A normal promotion needs both
+      # images; branch_only is refused for a tag that has any, since it would
+      # leave the stable image tag on a different release than the branch.
       - name: Check the images exist
-        if: ${{ !inputs.branch_only }}
         env:
           TAG: ${{ inputs.tag }}
+          BRANCH_ONLY: ${{ inputs.branch_only }}
         run: |
           set -euo pipefail
+          published=0
           for image in freeframe-api freeframe-web; do
             digest="$(.github/scripts/image_digest.sh "ghcr.io/techiebutler/${image}:${TAG}")"
-            if [ -z "${digest}" ]; then
-              echo "::error::No published images for ${TAG}. Run the \"Publish images\" workflow for ${TAG} first, or re-run with branch_only=true for a release from before images were published."
+            if [ -n "${digest}" ]; then
+              published=$((published + 1))
+              echo "ghcr.io/techiebutler/${image}:${TAG} is ${digest}"
+            else
+              echo "ghcr.io/techiebutler/${image}:${TAG} is not published"
+            fi
+          done
+          if [ "${BRANCH_ONLY}" = "true" ]; then
+            if [ "${published}" -gt 0 ]; then
+              echo "::error::${TAG} has published images, so branch_only=true would leave the stable image tag on another release. branch_only is only for releases from before images were published; re-run without it."
               exit 1
             fi
-            echo "ghcr.io/techiebutler/${image}:${TAG} is ${digest}"
-          done
+          elif [ "${published}" -lt 2 ]; then
+            echo "::error::No published images for ${TAG}. Run the \"Publish images\" workflow for ${TAG} first, or re-run with branch_only=true for a release from before images were published."
+            exit 1
+          fi
 
       - name: Verify CI is green, then move `stable`
         env:
