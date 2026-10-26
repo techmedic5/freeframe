@@ -5,7 +5,14 @@ import { withBasePath } from './lib/base-path'
 const PUBLIC_ROUTES = ['/login', '/setup']
 const PUBLIC_PREFIXES = ['/invite/', '/share/']
 
-const API_URL = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000'
+// Server-to-server address. NEXT_PUBLIC_API_URL is written for the browser (in
+// the production image it is the relative path `/api`, which a server-side
+// fetch cannot resolve), so the setup check would always fail and the redirect
+// to /setup would never fire. API_INTERNAL_URL is the address from inside the
+// web container (`http://api:8000` under compose); same fallback order as
+// lib/branding-server.ts.
+const API_URL =
+  process.env.API_INTERNAL_URL || process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000'
 
 function isPublicRoute(pathname: string): boolean {
   if (PUBLIC_ROUTES.includes(pathname)) return true

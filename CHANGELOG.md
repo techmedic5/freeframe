@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Upgrade notes
+- **The upload concurrency is read when the web container starts, not when the image is built.** Set `UPLOAD_CONCURRENCY` in `.env.prod` and recreate web with `docker compose --env-file .env.prod -f docker-compose.prod.yml up -d web`; no rebuild is needed. Your existing `NEXT_PUBLIC_UPLOAD_CONCURRENCY` line keeps working and gives the same value as before, because `UPLOAD_CONCURRENCY` is used when set and the older name otherwise. Installs that serve FreeFrame under a sub-path keep building the web image from source exactly as they do now (`docker compose --env-file .env.prod -f docker-compose.prod.yml up -d --build`), with no new step. A web image built for the domain root now refuses to start when `NEXT_PUBLIC_BASE_PATH` names a sub-path, with a message saying to build the web image yourself, instead of starting and serving broken links.
+
+### Changed
+- **The web app's upload concurrency is a runtime setting, `UPLOAD_CONCURRENCY`.** It used to be baked into the web image at build time as `NEXT_PUBLIC_UPLOAD_CONCURRENCY`, so changing it meant rebuilding. The pages are now rendered per request and the server hands the value to the browser, so recreating the container is enough. `NEXT_PUBLIC_UPLOAD_CONCURRENCY` is still read when `UPLOAD_CONCURRENCY` is unset, and `docker-compose.prod.yml` no longer passes it as a build argument. The production web and API image builds also now ignore local files such as `node_modules` and `.next`, which makes a build from a development checkout much faster.
+
+### Fixed
+- **A fresh production install now redirects to `/setup`.** The web app's setup check called the API at the browser's address, `/api`, which a server cannot resolve, so it failed quietly and the redirect to the setup page never happened in production. It now uses `API_INTERNAL_URL`, the address the branding fetch already used.
+
 ## [1.21.0] - 2026-10-24
 
 Folder uploads and a project settings page. Drop a folder, or choose Upload folder, and its files upload with the folder tree recreated; a project's owner now edits its details, members and share page branding on one settings page, and every kind of share link shows the project's logo, colour and footer. The web app moves to Next.js 16 and React 19, leaving the Next.js 14 line, which no longer gets security fixes (see Security). This release also adds settings for the S3 storage class and the audio bitrate of review streams, transcodes portrait video at its own size, and carries fixes to uploads, compare, invites, sign-in and production logging.

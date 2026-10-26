@@ -8,7 +8,14 @@ import { getServerBranding } from "@/lib/branding-server";
 import { accentVars } from "@/lib/accent";
 import { withBasePath } from "@/lib/base-path";
 import { logoUrlFromApi } from "@/lib/branding-logo";
+import { serverUploadConcurrency } from "@/lib/runtime-config";
 import "./globals.css";
+
+// Rendered per request so the container's environment is read when the server
+// starts serving, not when the image was built. The published web image is one
+// build for every install, so settings such as the upload concurrency have to
+// reach the page at runtime (see lib/runtime-config.ts).
+export const dynamic = "force-dynamic";
 
 const dmSans = DM_Sans({
   subsets: ["latin"],
@@ -66,6 +73,7 @@ export default async function RootLayout({
     <html
       lang="en"
       suppressHydrationWarning
+      data-ff-upload-concurrency={String(serverUploadConcurrency())}
       style={accent as React.CSSProperties | undefined}
     >
       <head>
