@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- **Copy buttons work when FreeFrame is served over plain HTTP.** The share links table, a comment's Copy Link, the share link detail page and the collection share dialog called `navigator.clipboard` directly, which does not exist outside a secure context (for example `http://192.168.1.20:3000`), so the table and comment buttons threw and the others did nothing. They now use the shared clipboard helper, which falls back to the browser's copy command, and the copied state shows only when the copy worked.
+
 ## [1.21.0] - 2026-10-24
 
 Folder uploads and a project settings page. Drop a folder, or choose Upload folder, and its files upload with the folder tree recreated; a project's owner now edits its details, members and share page branding on one settings page, and every kind of share link shows the project's logo, colour and footer. The web app moves to Next.js 16 and React 19, leaving the Next.js 14 line, which no longer gets security fixes (see Security). This release also adds settings for the S3 storage class and the audio bitrate of review streams, transcodes portrait video at its own size, and carries fixes to uploads, compare, invites, sign-in and production logging.
