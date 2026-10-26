@@ -402,11 +402,13 @@ jobs:
 
   # The `latest` branch follows the `latest` image: it moves only after both
   # images are tagged, and only for GitHub's latest release, so a failed build
-  # or a backport leaves it where it was.
+  # or a backport leaves it where it was. The job always runs once both images
+  # are tagged and decides inside the step: a job skipped by `if:` leaves a
+  # `skipped` check-run on the tag commit, and promote-stable.yml's CI gate
+  # would then refuse to promote a backport.
   move-latest:
     name: Move latest branch
     needs: [resolve, merge]
-    if: needs.resolve.outputs.is_latest == 'true'
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -418,15 +420,28 @@ jobs:
         env:
           TAG: ${{ needs.resolve.outputs.tag }}
           COMMIT: ${{ needs.resolve.outputs.sha }}
+          IS_LATEST: ${{ needs.resolve.outputs.is_latest }}
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
+          if [ "${IS_LATEST}" != "true" ]; then
+            echo "::notice::${TAG} is not GitHub's latest release; the latest branch was left where it was."
+            exit 0
+          fi
           # Same re-check as the tagging job: a newer release published during
           # the build owns the branch now.
           now="$(gh api "repos/${GITHUB_REPOSITORY}/releases/latest" --jq .tag_name)"
           if [ "${now}" != "${TAG}" ]; then
             echo "::warning::${now} is now the latest release; leaving the latest branch alone."
             exit 0
+          fi
+          # The checkout is the workflow's own commit at depth 1 (main's HEAD on
+          # a manual run), which need not contain the tag's commit: fetch it, or
+          # the push fails with "bad object".
+          git fetch --force origin "refs/tags/${TAG}:refs/tags/${TAG}"
+          if [ "$(git rev-list -n1 "refs/tags/${TAG}")" != "${COMMIT}" ]; then
+            echo "::error::${TAG} moved during the run (now $(git rev-list -n1 "refs/tags/${TAG}"), images built from ${COMMIT}); not moving latest."
+            exit 1
           fi
           echo "Moving latest -> ${TAG} (${COMMIT})"
           git push --force origin "${COMMIT}:refs/heads/latest"
