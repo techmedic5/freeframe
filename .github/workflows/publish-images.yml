@@ -38,7 +38,6 @@ concurrency:
 permissions: {}
 
 env:
-  REGISTRY: ghcr.io/techiebutler
   API_TITLE: FreeFrame API
   API_DESCRIPTION: "FreeFrame API server, also run as the Celery workers and beat. Self-hosted media review, annotation and approval."
   WEB_TITLE: FreeFrame web
@@ -240,6 +239,8 @@ jobs:
       attestations: write
       artifact-metadata: write
     strategy:
+      # One image failing must not cancel the other halfway through tagging.
+      fail-fast: false
       matrix:
         image: [api, web]
     # One tagging job per image at a time, across all tags: two releases
@@ -318,8 +319,10 @@ jobs:
           done
           cat "${RUNNER_TEMP}/before.tsv"
 
-      # The annotations are set at creation so the index digest made here is
-      # the final one, and is the digest that gets attested.
+      # Only the version's own tags are created here. The annotations are set
+      # at creation so the index digest made here is the final one, and is the
+      # digest that gets attested; the aliases follow only after the
+      # attestation exists, so none ever points at an unattested digest.
       - name: Create the multi-arch index
         id: create
         env:
@@ -334,12 +337,7 @@ jobs:
             echo "::error::Expected 2 platform digests, found ${#sources[@]}."
             exit 1
           fi
-          args=()
-          while read -r t; do
-            [ -n "${t}" ] && args+=(-t "${IMAGE}:${t}")
-          done < "${RUNNER_TEMP}/tags.txt"
-
-          docker buildx imagetools create "${args[@]}" \
+          docker buildx imagetools create -t "${IMAGE}:${VERSION}" -t "${IMAGE}:${TAG}" \
             --annotation "index:org.opencontainers.image.description=${DESCRIPTION}" \
             --annotation "index:org.opencontainers.image.source=https://github.com/${GITHUB_REPOSITORY}" \
             --annotation "index:org.opencontainers.image.licenses=MIT" \
@@ -360,21 +358,26 @@ jobs:
           subject-digest: ${{ steps.create.outputs.digest }}
           push-to-registry: true
 
-      # A retag from a single index without --annotation keeps its digest, so
-      # each re-pointed alias carries the attestation made above.
-      - name: Re-point aliases left on the old digest
+      # The aliases this release takes (`X.Y`, `latest`), then any a rebuild
+      # must re-point because they were still on the version's old digest. A
+      # retag from a single index without --annotation keeps its digest, so
+      # every alias carries the attestation made above.
+      - name: Point the aliases at the attested digest
         env:
           DIGEST: ${{ steps.create.outputs.digest }}
         run: |
           set -euo pipefail
-          aliases="$(python3 .github/scripts/image_tags.py repoint "${TAG}" \
-            --tags-file "${RUNNER_TEMP}/tags.txt" --digests-file "${RUNNER_TEMP}/before.tsv")"
-          echo "${aliases}" > "${RUNNER_TEMP}/repointed.txt"
+          python3 .github/scripts/image_tags.py repoint "${TAG}" \
+            --tags-file "${RUNNER_TEMP}/tags.txt" --digests-file "${RUNNER_TEMP}/before.tsv" \
+            > "${RUNNER_TEMP}/repointed.txt"
           while read -r alias; do
             [ -z "${alias}" ] && continue
-            echo "Re-pointing ${alias} (was the old ${VERSION}) to ${DIGEST}"
+            if [ "${alias}" = "${VERSION}" ] || [ "${alias}" = "${TAG}" ]; then
+              continue # created with the index
+            fi
+            echo "Pointing ${alias} at ${DIGEST}"
             docker buildx imagetools create -t "${IMAGE}:${alias}" "${IMAGE}@${DIGEST}"
-          done < "${RUNNER_TEMP}/repointed.txt"
+          done < <(cat "${RUNNER_TEMP}/tags.txt" "${RUNNER_TEMP}/repointed.txt")
 
       - name: Check and summarise
         env:
