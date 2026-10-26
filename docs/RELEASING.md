@@ -51,6 +51,12 @@ Releases before v1.21.0 have no images.
      `gh release create v1.20.3 --latest=false` so GitHub does not mark it the
      latest release. It then gets `1.20.3`, `v1.20.3` and `1.20`, and `latest`
      stays put.
+   - A backport tag cut from a branch that predates `publish-images.yml`
+     triggers nothing when its release is published (the release event runs
+     the workflow file at the tag's commit), so run "Publish images" for it by
+     hand. Worse, such a branch still has the old `release-pointers.yml`,
+     which would move the `latest` branch to the backport: delete that file
+     on the branch before tagging.
    - If an image fails to build, `latest` (branch and image tag) stays where
      it was; fix the cause and re-run the workflow as below.
 
@@ -95,7 +101,7 @@ release (soak it as `latest`, smoke-test, watch for breakage reports).
 - Rolling back to a release from before images were published (anything older
   than v1.21.0) needs `branch_only: true`. It moves the branch and leaves the
   `stable` image tag where it was; those releases' compose files build from
-  source and never read it.
+  source and never read it. It is refused for a tag that has published images.
 - Optionally edit the bad GitHub Release to mark it clearly broken. The
   immutable `vX.Y.Z` tag stays as-is; only the `stable` pointer retreats.
 
