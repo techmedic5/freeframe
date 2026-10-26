@@ -20,6 +20,11 @@ import pytest
 
 SCRIPT = pathlib.Path(__file__).resolve().parents[3] / ".github" / "scripts" / "image_tags.py"
 
+# The dev API container mounts only apps/api and packages/transcoder, so the
+# script is not there when the suite runs inside it (AGENTS.md's command).
+if not SCRIPT.exists():
+    pytest.skip(f"{SCRIPT} is not in this tree (run from a full checkout)", allow_module_level=True)
+
 
 def _load():
     spec = importlib.util.spec_from_file_location("image_tags", SCRIPT)
