@@ -7,8 +7,21 @@ self-hosters can track a known-good version instead of `main`.
 |-----|--------|--------------|-----|
 | `main` | every merge | contributors | development |
 | `vX.Y.Z` | never | release cutter (manual tag) | permanent history / pinning |
-| `latest` | every release | **`release-pointers.yml`** (auto) | early adopters |
+| `latest` | every release | **`publish-images.yml`** (auto, after both images are published) | early adopters |
 | `stable` | on promotion | **`promote-stable.yml`** (manual) | production self-hosters |
+
+Each release also publishes two multi-arch images (`linux/amd64` and
+`linux/arm64`), `ghcr.io/techiebutler/freeframe-api` and
+`ghcr.io/techiebutler/freeframe-web`, whose tags follow the refs:
+
+| Image tag | Moves? | Who moves it |
+|-----------|--------|--------------|
+| `X.Y.Z` and `vX.Y.Z` | never to new source (a rebuild only refreshes the base image) | `publish-images.yml` |
+| `X.Y` | with each newer patch of that line | `publish-images.yml` |
+| `latest` | with the `latest` branch | `publish-images.yml`, only for GitHub's latest release |
+| `stable` | with the `stable` branch | `promote-stable.yml`, the promoted tag's exact digest |
+
+Releases before v1.21.0 have no images.
 
 ## Cutting a release
 
@@ -29,12 +42,36 @@ self-hosters can track a known-good version instead of `main`.
 3. Publish a **GitHub Release** for `vX.Y.Z` with notes (the CHANGELOG section,
    `### Contributors` line included — the release notes are where a contributor's
    name actually gets seen, so don't drop it here even if you trim anything else).
-   - Publishing it triggers `release-pointers.yml`, which **auto-moves `latest`**
-     to `vX.Y.Z`. (Mark it a *pre-release* to keep `latest` where it is.)
+   - Publishing it triggers `publish-images.yml`, which builds both images on
+     amd64 and arm64, tags them, attests them, and then **auto-moves `latest`**
+     (the branch and the image tag) to `vX.Y.Z`, but only when `vX.Y.Z` is
+     GitHub's latest release. A *pre-release* gets only its `X.Y.Z` and
+     `vX.Y.Z` image tags and moves nothing.
+   - Publishing a patch for an older line (say v1.20.3 after v1.21.0)? Use
+     `gh release create v1.20.3 --latest=false` so GitHub does not mark it the
+     latest release. It then gets `1.20.3`, `v1.20.3` and `1.20`, and `latest`
+     stays put.
+   - If an image fails to build, `latest` (branch and image tag) stays where
+     it was; fix the cause and re-run the workflow as below.
+
+## Rebuilding or backfilling images
+
+Run the **"Publish images"** workflow (Actions, Run workflow) with
+`tag: vX.Y.Z`. It builds that tag's commit and overwrites the version's own
+tags. `X.Y`, `latest` and `stable` move to the rebuilt image only where they
+still pointed at that version's previous image, so a rebuild never takes them
+from a newer release. Use it to publish a release whose run failed, or to pick
+up a base-image security fix.
+
+Check where an image came from with:
+
+```bash
+gh attestation verify oci://ghcr.io/techiebutler/freeframe-api:vX.Y.Z --repo Techiebutler/freeframe
+```
 
 ## Promoting to `stable`
 
-`latest` moves immediately; `stable` moves only after you've validated the
+`latest` moves as soon as the release's images are published; `stable` moves only after you've validated the
 release (soak it as `latest`, smoke-test, watch for breakage reports).
 
 - Run the **"Promote release to stable"** workflow (Actions → Run workflow) with
@@ -42,6 +79,12 @@ release (soak it as `latest`, smoke-test, watch for breakage reports).
 - It **refuses to promote unless that tag's commit passed CI** (≥1 check-run and
   all `success`). Use `force: true` only for a tag that legitimately has no CI
   (e.g. docs-only).
+- It **moves the branch and the `stable` image tag together.** Before anything
+  moves it checks that both images exist for `vX.Y.Z`, and refuses if they do
+  not (run "Publish images" for that tag first). After moving the branch it
+  points `stable` on both images at the exact digest of `vX.Y.Z` (a retag, not
+  a rebuild) and checks they match. If that last step fails, re-run the
+  workflow with the same tag; repeating it is harmless.
 
 ## Rolling back a bad release
 
@@ -49,6 +92,10 @@ release (soak it as `latest`, smoke-test, watch for breakage reports).
 
 - Run **"Promote release to stable"** again with the previous good `tag`
   (e.g. `v1.3.0`).
+- Rolling back to a release from before images were published (anything older
+  than v1.21.0) needs `branch_only: true`. It moves the branch and leaves the
+  `stable` image tag where it was; those releases' compose files build from
+  source and never read it.
 - Optionally edit the bad GitHub Release to mark it clearly broken. The
   immutable `vX.Y.Z` tag stays as-is; only the `stable` pointer retreats.
 
@@ -58,5 +105,9 @@ release (soak it as `latest`, smoke-test, watch for breakage reports).
 - `latest`/`stable` must **not** have required-review branch protection, or the
   workflows' `GITHUB_TOKEN` (`contents: write`) can't push them. Only `main` is
   protected.
+- Each GHCR package (`freeframe-api`, `freeframe-web`) has to be made public
+  by hand once, after its first push (org Packages, the package, Package
+  settings, Change visibility). GitHub creates a package as private and has no
+  API to change that; until then an anonymous `docker pull` fails.
 - Moving `latest`/`stable` does **not** run `ci.yml` (it triggers on
   `push: branches: [main]` only), so there's no CI storm and no trigger loop.

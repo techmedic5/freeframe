@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **Prebuilt multi-arch images on GHCR for every release.** Publishing a release now builds `ghcr.io/techiebutler/freeframe-api` and `ghcr.io/techiebutler/freeframe-web` for `linux/amd64` and `linux/arm64`, each on a native runner, and tags them `X.Y.Z`, `vX.Y.Z`, `X.Y` (not for pre-releases, and not when a newer patch of that line exists) and `latest` (only for GitHub's latest release). Each image carries OCI labels, build provenance and an SBOM, plus a GitHub artifact attestation you can check with `gh attestation verify oci://ghcr.io/techiebutler/freeframe-api:vX.Y.Z --repo Techiebutler/freeframe`. The `latest` branch now moves after both images are published rather than the moment the release is, and only for GitHub's latest release, so a patch for an older line no longer moves it backwards and a failed build leaves the branch and the image where they were. The **Publish images** workflow can also be run by hand for an existing tag, to publish or rebuild its images; a rebuild re-points `X.Y`, `latest` and `stable` only where they still pointed at that version's previous image.
+
+### Changed
+- **Promoting a release to `stable` also moves the `stable` image tag**, to the exact image the release's own tag points at (a retag, never a rebuild). Promotion now refuses, before the branch moves, a tag that has no published images. To roll back to a release from before images were published (older than v1.21.0), run it with `branch_only: true`, which moves only the branch.
+
 ## [1.21.0] - 2026-10-24
 
 Folder uploads and a project settings page. Drop a folder, or choose Upload folder, and its files upload with the folder tree recreated; a project's owner now edits its details, members and share page branding on one settings page, and every kind of share link shows the project's logo, colour and footer. The web app moves to Next.js 16 and React 19, leaving the Next.js 14 line, which no longer gets security fixes (see Security). This release also adds settings for the S3 storage class and the audio bitrate of review streams, transcodes portrait video at its own size, and carries fixes to uploads, compare, invites, sign-in and production logging.

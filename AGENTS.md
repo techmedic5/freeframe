@@ -174,12 +174,12 @@ FreeFrame ships **moving branch pointers** on top of immutable `vX.Y.Z` tags. Kn
 
 - **`main`** — active development. PRs target `main`; it may be ahead of any release.
 - **`stable`** — the last **validated** release. **This is what production self-hosters run** (`git clone -b stable`). Never tell users to run `main` in production, and don't point install/deploy docs at `main` — point them at `stable`.
-- **`latest`** — the newest published release (auto-moved by `.github/workflows/release-pointers.yml`). For early adopters.
+- **`latest`**: the newest published release (auto-moved by `.github/workflows/publish-images.yml` once that release's images are published). For early adopters.
 - **`vX.Y.Z`** — immutable release tags; never move or delete them.
 
 Rules for agents:
 
-- **Don't create, move, or force-push `stable` / `latest`** — they are moved only by the release workflows (`release-pointers.yml` on release publish; `promote-stable.yml` manually, which gates on green CI). See [`docs/RELEASING.md`](docs/RELEASING.md).
+- **Don't create, move, or force-push `stable` / `latest`**: they are moved only by the release workflows (`publish-images.yml` on release publish, after the images; `promote-stable.yml` manually, which gates on green CI). See [`docs/RELEASING.md`](docs/RELEASING.md).
 - **Don't cut releases or tags** unless explicitly asked — releases are manual and CHANGELOG-driven.
 - Default user-facing install/deploy instructions to `stable` (see the README "Release channels" table).
 
