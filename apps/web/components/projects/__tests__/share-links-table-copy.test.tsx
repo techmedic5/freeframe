@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import { render, screen, fireEvent, waitFor } from '@testing-library/react'
+import { render, screen, fireEvent, waitFor, act } from '@testing-library/react'
 import { ShareLinksTable } from '../share-links-table'
 import type { ShareLinkListItem } from '@/types'
 
@@ -9,6 +9,8 @@ import type { ShareLinkListItem } from '@/types'
 
 let copied: string | null
 let execCommand: ReturnType<typeof vi.fn>
+const originalClipboard = Object.getOwnPropertyDescriptor(navigator, 'clipboard')
+const originalExecCommand = document.execCommand
 
 beforeEach(() => {
   copied = null
@@ -26,6 +28,9 @@ beforeEach(() => {
 
 afterEach(() => {
   vi.restoreAllMocks()
+  if (originalClipboard) Object.defineProperty(navigator, 'clipboard', originalClipboard)
+  else delete (navigator as { clipboard?: unknown }).clipboard
+  document.execCommand = originalExecCommand
 })
 
 const link: ShareLinkListItem = {
@@ -37,9 +42,6 @@ const link: ShareLinkListItem = {
 
 describe('ShareLinksTable copy button on plain HTTP', () => {
   it('copies the link through the execCommand fallback and shows the copied state', async () => {
-    const unhandled = vi.fn()
-    process.on('unhandledRejection', unhandled)
-
     const { container } = render(
       <ShareLinksTable
         shareLinks={[link]}
@@ -55,9 +57,8 @@ describe('ShareLinksTable copy button on plain HTTP', () => {
 
     await waitFor(() => expect(container.querySelector('.lucide-check')).not.toBeNull())
     expect(copied).toBe('http://192.168.1.20:3000/share/tok123')
-    await new Promise((r) => setTimeout(r, 0))
-    expect(unhandled).not.toHaveBeenCalled()
-    process.off('unhandledRejection', unhandled)
+    // A rejected copy would surface as an unhandled error, which fails the
+    // vitest run on its own; no manual listener needed.
   })
 
   it('does not show the copied state when the copy fails', async () => {
@@ -72,7 +73,10 @@ describe('ShareLinksTable copy button on plain HTTP', () => {
       />,
     )
     fireEvent.click(screen.getByTitle('Copy link'))
-    await new Promise((r) => setTimeout(r, 20))
+    // The fallback was really attempted, and its failure was handled.
+    await waitFor(() => expect(execCommand).toHaveBeenCalledWith('copy'))
+    // Flush the helper's promise and the handler's continuation.
+    await act(async () => {})
     expect(container.querySelector('.lucide-check')).toBeNull()
   })
 })

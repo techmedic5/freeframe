@@ -7,6 +7,8 @@ import { CommentPanel } from '../comment-panel'
 // menu used to throw a TypeError. It must use the execCommand fallback.
 
 let copied: string | null
+const originalClipboard = Object.getOwnPropertyDescriptor(navigator, 'clipboard')
+const originalExecCommand = document.execCommand
 
 beforeEach(() => {
   useReviewStore.getState().reset()
@@ -25,6 +27,9 @@ beforeEach(() => {
 
 afterEach(() => {
   vi.restoreAllMocks()
+  if (originalClipboard) Object.defineProperty(navigator, 'clipboard', originalClipboard)
+  else delete (navigator as { clipboard?: unknown }).clipboard
+  document.execCommand = originalExecCommand
 })
 
 const noop = async () => {}
@@ -40,9 +45,6 @@ const own = {
 
 describe('CommentPanel Copy Link on plain HTTP', () => {
   it('copies the comment link via the fallback and closes the menu', async () => {
-    const unhandled = vi.fn()
-    process.on('unhandledRejection', unhandled)
-
     render(
       <CommentPanel
         comments={[own]}
@@ -58,8 +60,7 @@ describe('CommentPanel Copy Link on plain HTTP', () => {
     await waitFor(() => expect(copied).not.toBeNull())
     expect(new URL(copied as unknown as string).searchParams.get('commentId')).toBe('c1')
     expect(screen.queryByRole('button', { name: 'Copy Link' })).toBeNull()
-    await new Promise((r) => setTimeout(r, 0))
-    expect(unhandled).not.toHaveBeenCalled()
-    process.off('unhandledRejection', unhandled)
+    // A rejected copy would surface as an unhandled error, which fails the
+    // vitest run on its own; no manual listener needed.
   })
 })
