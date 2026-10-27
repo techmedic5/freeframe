@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- Guest **Download All** streams one ZIP containing the current folder and its nested folders, with visible progress/errors and the existing original-download policy. It includes all matching files rather than only the first page.
+- Guest viewers have Previous/Next controls and touch swipes between assets in gallery search/sort order, including unloaded pages. Swipes leave zoomed photos, drawing, image carousels and video seeking alone.
+
 ### Fixed
 - Shared folder cards show thumbnails from nested folders, so folders that organize media into subfolders no longer appear empty. Direct files remain first, and previews stay within the folder's live project subtree.
 

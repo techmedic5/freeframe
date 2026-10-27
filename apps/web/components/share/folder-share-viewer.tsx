@@ -24,7 +24,7 @@ import { useShareAppearance } from '@/hooks/use-share-appearance'
 import { withBasePath } from '@/lib/base-path'
 import { useReview, type CreateCommentPayload } from '@/components/review/review-provider'
 import { useReviewStore } from '@/stores/review-store'
-import { fetchDownloadUrl, fetchShareDownloadOptions, handleDownload, triggerDownload } from './share-download'
+import { downloadShareArchive, fetchShareDownloadOptions, handleDownload, type ShareArchiveStatus } from './share-download'
 import { DownloadMenu } from '@/components/shared/download-menu'
 import { CommentCountBadge } from '@/components/shared/comment-count-badge'
 import { ShareReviewScreen, type ShareAssetNavigation } from './share-review-screen'
@@ -124,51 +124,6 @@ function getAssetTypeBadgeLabel(assetType: string): string {
 
 
 
-
-async function collectAllAssetsRecursive(
-  token: string,
-  folderId: string | null,
-  shareSession?: string | null,
-): Promise<{ id: string; name: string }[]> {
-  // Fetch assets + subfolders at this level, then recurse into subfolders.
-  const sp = shareSession ? `&share_session=${encodeURIComponent(shareSession)}` : ''
-  const folderParam = folderId ? `folder_id=${folderId}&` : ''
-  try {
-    const res = await fetch(`${API_URL}/share/${token}/assets?${folderParam}page=1&per_page=500${sp}`)
-    if (!res.ok) return []
-    const data = await res.json() as { assets?: { id: string; name: string }[]; subfolders?: { id: string }[] }
-    const items: { id: string; name: string }[] = (data.assets ?? []).map((a) => ({ id: a.id, name: a.name }))
-    const subfolders = data.subfolders ?? []
-    for (const sub of subfolders) {
-      const nested = await collectAllAssetsRecursive(token, sub.id, shareSession)
-      items.push(...nested)
-    }
-    return items
-  } catch {
-    return []
-  }
-}
-
-async function handleDownloadAll(
-  token: string,
-  folderId: string | null,
-  shareSession?: string | null,
-) {
-  // Recursively collect all assets (including those in subfolders),
-  // pre-fetch presigned URLs in parallel, then trigger downloads
-  // sequentially with a delay so the browser doesn't block them. Same rule as
-  // bulk download on the project page: originals when the instance allows them,
-  // transcodes otherwise.
-  const allAssets = await collectAllAssetsRecursive(token, folderId, shareSession)
-  const urls = await Promise.all(
-    allAssets.map((a) => fetchDownloadUrl(token, a.id, shareSession, undefined, true)),
-  )
-  for (const url of urls) {
-    if (!url) continue
-    triggerDownload(url)
-    await new Promise((r) => setTimeout(r, 800))
-  }
-}
 
 // ─── Subfolder Card ───────────────────────────────────────────────────────────
 
@@ -680,6 +635,23 @@ export function FolderShareViewer({
   const [navigationLoading, setNavigationLoading] = React.useState(false)
   const [navigationError, setNavigationError] = React.useState<string | null>(null)
   const [navigationAttempt, setNavigationAttempt] = React.useState(0)
+  const [archiveBusy, setArchiveBusy] = React.useState(false)
+  const [archiveStatus, setArchiveStatus] = React.useState<ShareArchiveStatus | null>(null)
+  const [archiveError, setArchiveError] = React.useState<string | null>(null)
+
+  async function downloadAll() {
+    if (archiveBusy || !allowDownload) return
+    setArchiveBusy(true)
+    setArchiveStatus(null)
+    setArchiveError(null)
+    try {
+      await downloadShareArchive(token, currentSubfolderId, shareSession, setArchiveStatus)
+    } catch (error) {
+      setArchiveError(error instanceof Error ? error.message : 'Could not download the ZIP. Please try again.')
+    } finally {
+      setArchiveBusy(false)
+    }
+  }
 
   const accentColor = appearance.accent_color ?? branding?.primary_color
   // No fallback: a link with no accent of its own, on an instance with no
@@ -987,11 +959,13 @@ export function FolderShareViewer({
         <div className="flex items-center gap-2 shrink-0">
           {allowDownload && (
             <button
-              className="flex items-center gap-1.5 h-7 px-3 rounded-md text-xs font-medium text-white bg-accent hover:bg-accent-hover transition-colors"
-              onClick={() => handleDownloadAll(token, currentSubfolderId ?? null, shareSession)}
+              className="flex items-center gap-1.5 h-7 px-3 rounded-md text-xs font-medium text-white bg-accent hover:bg-accent-hover transition-colors disabled:opacity-60 disabled:cursor-wait"
+              onClick={downloadAll}
+              disabled={archiveBusy}
+              title="Download all files in this folder as one ZIP"
             >
-              <Download className="h-3 w-3" />
-              Download All
+              {archiveBusy ? <Loader2 className="h-3 w-3 animate-spin" /> : <Download className="h-3 w-3" />}
+              {archiveBusy ? 'Downloading ZIP…' : 'Download All'}
             </button>
           )}
           <button
@@ -1003,6 +977,16 @@ export function FolderShareViewer({
           </button>
         </div>
       </header>
+
+      {(archiveBusy || archiveStatus || archiveError) && (
+        <div role={archiveError ? 'alert' : 'status'} className={cn('border-b border-border px-5 py-2 text-sm', archiveError ? 'text-red-400' : 'text-text-secondary')}>
+          {archiveError || (archiveStatus?.status === 'complete'
+            ? 'ZIP sent to your browser. Check Downloads to confirm it was saved.'
+            : archiveStatus?.status === 'downloading'
+              ? `Sending ZIP: ${archiveStatus.completed_files} of ${archiveStatus.file_count} files. Keep this page open for download updates.`
+              : 'Preparing your ZIP download…')}
+        </div>
+      )}
 
       {/* ─── Content area ──────────────────────────────────────────────── */}
       <div className="relative flex flex-1 overflow-hidden">

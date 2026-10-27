@@ -30,6 +30,8 @@ FreeFrame gives production houses and creative teams a self-hosted platform for 
 - **Share links** for external reviewers (password-protected, expiring)
 - **Guest commenting** via share links (no account required)
 - **Folder previews** on share pages include media in nested folders, with up to four thumbnails per folder card.
+- **One ZIP download** for a shared folder and its nested folders, streamed without saving another archive in object storage.
+- **Guest viewer navigation** with Previous/Next and touch swipes, following the current folder's search and sort order across pages. Zoom, drawing, image-carousel controls and video seeking keep their existing gestures.
 - **Due date tracking** with email reminders
 - **Real-time updates** via Server-Sent Events
 - **White-label it completely** — your workspace name, logos, favicon and accent colour across the app, share links and emails; the "Powered by FreeFrame" badge switches off
