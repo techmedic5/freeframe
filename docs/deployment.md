@@ -10,7 +10,9 @@ Archive preparation requires a ready download for every selected asset. Processi
 
 Allow long streaming responses through your proxy and disable response buffering for archive downloads. The endpoint sends `X-Accel-Buffering: no`. ZIP speed is limited by the application server's outbound bandwidth; interrupted transfers restart from the beginning rather than resuming. Share expiration, revocation, or a file/policy change can interrupt an active ZIP. Server-complete status means the response was sent, not that the browser saved it.
 
-`SHARE_ARCHIVE_MAX_FILES` defaults to `10000`; larger selections receive an explicit error asking for a smaller folder. `SHARE_ARCHIVE_MAX_STREAMS` defaults to `2` concurrent ZIP streams across API workers. Prepared requests expire after five minutes; a stream may run for up to four hours; terminal status expires after five minutes. Both settings are optional environment variables and require no database migration.
+`SHARE_ARCHIVE_MAX_FILES` defaults to `10000`; larger selections receive an explicit error asking for a smaller folder. This is a safety ceiling: preparation still validates each asset, so larger selections take longer. `SHARE_ARCHIVE_MAX_STREAMS` defaults to `2` concurrent ZIP streams across API workers. Both settings are optional environment variables and require no database migration.
+
+Prepared manifests expire after five minutes and are removed when streaming starts. Progress is stored separately. Active streams hold a 90-second capacity lease refreshed every 20 seconds, including while clients receive slowly; a crashed worker releases capacity when its lease expires. A stream may run for up to four hours, and terminal status expires after five minutes.
 
 Password-protected shares retain their existing one-hour guest session lifetime, which is checked during streaming. For a download exceeding that window, re-enter the password and download smaller folders or individual files.
 
