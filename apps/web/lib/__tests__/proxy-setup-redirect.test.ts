@@ -12,6 +12,7 @@ import { NextRequest } from 'next/server'
 afterEach(() => {
   vi.unstubAllEnvs()
   vi.unstubAllGlobals()
+  vi.restoreAllMocks()
   vi.resetModules()
 })
 
@@ -33,5 +34,37 @@ describe('proxy setup redirect', () => {
     expect(fetchMock.mock.calls[0][0]).toBe('http://api:8000/setup/status')
     expect(res.status).toBe(307)
     expect(new URL(res.headers.get('location')!).pathname).toBe('/setup')
+  })
+
+  it('gives up on a slow API after 2 seconds and lets the request through', async () => {
+    // A migrating or overloaded API must not hold navigation: the check is
+    // abandoned after 2 seconds, as if the API were unreachable.
+    vi.stubEnv('API_INTERNAL_URL', 'http://api:8000')
+    const timer = new AbortController()
+    const timeout = vi.spyOn(AbortSignal, 'timeout').mockReturnValue(timer.signal)
+    const fetchMock = vi.fn(
+      (_url: string, init?: RequestInit) =>
+        new Promise((_resolve, reject) => {
+          init?.signal?.addEventListener('abort', () =>
+            reject(new DOMException('The operation timed out.', 'TimeoutError')),
+          )
+        }),
+    )
+    vi.stubGlobal('fetch', fetchMock)
+    vi.resetModules()
+    const { proxy } = await import('../../proxy')
+
+    const pending = proxy(new NextRequest('http://localhost:3000/projects'))
+    expect(timeout).toHaveBeenCalledWith(2000)
+    expect(fetchMock.mock.calls[0][1]?.signal).toBe(timer.signal)
+    timer.abort()
+    const res = await pending
+
+    // Through to the normal auth check: no tokens, so the login page.
+    expect(res.status).toBe(307)
+    const location = new URL(res.headers.get('location')!)
+    expect(location.pathname).toBe('/login')
+    expect(location.searchParams.get('from')).toBe('/projects')
+    expect(res.cookies.get('ff_setup_done')).toBeUndefined()
   })
 })

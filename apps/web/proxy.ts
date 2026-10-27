@@ -35,6 +35,9 @@ export async function proxy(request: NextRequest) {
     try {
       const res = await fetch(`${API_URL}/setup/status`, {
         cache: 'no-store', // the ff_setup_done cookie is the cache
+        // A slow API (migrating, overloaded) must not hold navigation: after
+        // 2 seconds the check is dropped as if the API were unreachable.
+        signal: AbortSignal.timeout(2000),
       })
       if (res.ok) {
         const data = await res.json()
