@@ -142,6 +142,42 @@ def _get_latest_media_file(db: Session, asset_id: uuid.UUID) -> Optional[MediaFi
     return db.query(MediaFile).filter(MediaFile.version_id == version.id).first()
 
 
+def _folder_thumbnail_urls(db: Session, folder: Folder) -> list[str]:
+    if not folder_chain_is_live(db, folder.id):
+        return []
+    subtree = sqlalchemy.select(Folder.id).where(
+        Folder.id == folder.id,
+        Folder.project_id == folder.project_id,
+        Folder.deleted_at.is_(None),
+    ).cte("preview_folders", recursive=True)
+    # UNION also terminates a malformed parent cycle without revisiting folders.
+    subtree = subtree.union(
+        sqlalchemy.select(Folder.id).join(subtree, Folder.parent_id == subtree.c.id).where(
+            Folder.project_id == folder.project_id,
+            Folder.deleted_at.is_(None),
+        )
+    )
+    latest_version = sqlalchemy.select(AssetVersion.id).where(
+        AssetVersion.asset_id == Asset.id,
+        AssetVersion.deleted_at.is_(None),
+        AssetVersion.processing_status == ProcessingStatus.ready,
+    ).order_by(AssetVersion.version_number.desc()).limit(1).correlate(Asset).scalar_subquery()
+    thumbnail = sqlalchemy.select(MediaFile.s3_key_thumbnail).where(
+        MediaFile.version_id == latest_version,
+    ).order_by(MediaFile.id).limit(1).correlate(Asset).scalar_subquery()
+    rows = db.query(thumbnail.label("thumbnail")).select_from(Asset).filter(
+        Asset.project_id == folder.project_id,
+        Asset.folder_id.in_(sqlalchemy.select(subtree.c.id)),
+        Asset.deleted_at.is_(None),
+        thumbnail.is_not(None),
+        thumbnail != "",
+    ).order_by(
+        case((Asset.folder_id == folder.id, 0), else_=1),
+        Asset.created_at.desc(), Asset.id,
+    ).limit(4).all()
+    return [generate_presigned_get_url(row.thumbnail) for row in rows]
+
+
 def _latest_version_comment_count(db: Session, asset_id: uuid.UUID) -> int:
     """Count public comments rendered in the asset's share-grid preview."""
     version = db.query(AssetVersion).filter(
@@ -1369,16 +1405,9 @@ def get_folder_share_assets(
                 child_folder_count = db.query(sa_func.count(Folder.id)).filter(
                     Folder.parent_id == sf.id, Folder.deleted_at.is_(None),
                 ).scalar() or 0
-                thumb_urls: list[str] = []
-                preview_assets = db.query(Asset).filter(
-                    Asset.folder_id == sf.id, Asset.deleted_at.is_(None),
-                ).order_by(Asset.created_at.desc()).limit(4).all()
-                for pa in preview_assets:
-                    mf = _get_latest_media_file(db, pa.id)
-                    if mf and mf.s3_key_thumbnail:
-                        thumb_urls.append(generate_presigned_get_url(mf.s3_key_thumbnail))
                 subfolder_items.append(FolderShareSubfolder(
-                    id=sf.id, name=sf.name, item_count=asset_count + child_folder_count, thumbnail_urls=thumb_urls,
+                    id=sf.id, name=sf.name, item_count=asset_count + child_folder_count,
+                    thumbnail_urls=_folder_thumbnail_urls(db, sf),
                 ))
 
         # Get shared assets
@@ -1453,24 +1482,11 @@ def get_folder_share_assets(
             Folder.deleted_at.is_(None),
         ).scalar() or 0
 
-        # Fetch up to 4 thumbnail previews from assets inside this subfolder
-        thumb_urls: list[str] = []
-        preview_assets = db.query(Asset).filter(
-            Asset.folder_id == sf.id,
-            Asset.deleted_at.is_(None),
-        ).order_by(Asset.created_at.desc()).limit(4).all()
-        for pa in preview_assets:
-            mf = _get_latest_media_file(db, pa.id)
-            if mf and mf.s3_key_thumbnail:
-                thumb_urls.append(generate_presigned_get_url(mf.s3_key_thumbnail))
-            if len(thumb_urls) >= 4:
-                break
-
         subfolder_items.append(FolderShareSubfolder(
             id=sf.id,
             name=sf.name,
             item_count=asset_count + child_folder_count,
-            thumbnail_urls=thumb_urls,
+            thumbnail_urls=_folder_thumbnail_urls(db, sf),
         ))
 
     # Get assets in this folder (or project root if target_folder_id is None)

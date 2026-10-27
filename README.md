@@ -29,6 +29,7 @@ FreeFrame gives production houses and creative teams a self-hosted platform for 
 - **Team collaboration** with role-based permissions (org, team, project levels)
 - **Share links** for external reviewers (password-protected, expiring)
 - **Guest commenting** via share links (no account required)
+- **Folder previews** on share pages include media in nested folders, with up to four thumbnails per folder card.
 - **Due date tracking** with email reminders
 - **Real-time updates** via Server-Sent Events
 - **White-label it completely** — your workspace name, logos, favicon and accent colour across the app, share links and emails; the "Powered by FreeFrame" badge switches off
