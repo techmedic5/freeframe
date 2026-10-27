@@ -164,11 +164,14 @@ def _folder_thumbnail_urls(db: Session, folder: Folder) -> list[str]:
     ).order_by(AssetVersion.version_number.desc()).limit(1).correlate(Asset).scalar_subquery()
     thumbnail = sqlalchemy.select(MediaFile.s3_key_thumbnail).where(
         MediaFile.version_id == latest_version,
+        MediaFile.s3_key_thumbnail.is_not(None),
+        MediaFile.s3_key_thumbnail != "",
     ).order_by(MediaFile.id).limit(1).correlate(Asset).scalar_subquery()
     rows = db.query(thumbnail.label("thumbnail")).select_from(Asset).filter(
         Asset.project_id == folder.project_id,
         Asset.folder_id.in_(sqlalchemy.select(subtree.c.id)),
         Asset.deleted_at.is_(None),
+        Asset.asset_type != AssetType.audio,
         thumbnail.is_not(None),
         thumbnail != "",
     ).order_by(

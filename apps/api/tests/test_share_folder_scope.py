@@ -215,6 +215,37 @@ def test_folder_previews_keep_direct_media_first_and_limit_to_four(real_db, seed
     assert urls[0] == "signed:thumb/direct"
 
 
+@pytest.mark.parametrize("missing_thumbnail", [None, ""])
+def test_carousel_preview_uses_later_media_with_a_thumbnail(real_db, seed, monkeypatch, missing_thumbnail):
+    from apps.api.models.asset import AssetType, FileType, MediaFile
+    from apps.api.routers.share import _folder_thumbnail_urls
+    monkeypatch.setattr("apps.api.routers.share.generate_presigned_get_url", lambda key: "signed:" + key)
+    _, version, first = _preview(real_db, seed["deep"], "carousel", asset_type=AssetType.image_carousel)
+    first.id = uuid.UUID(int=1)
+    first.s3_key_thumbnail = missing_thumbnail
+    real_db.add(MediaFile(
+        id=uuid.UUID(int=2), version_id=version.id, file_type=FileType.image,
+        original_filename="second.jpg", mime_type="image/jpeg", file_size_bytes=100,
+        s3_key_raw="raw/second.jpg", s3_key_thumbnail="thumb/second.jpg",
+    ))
+    real_db.flush()
+    assert _folder_thumbnail_urls(real_db, seed["shared"]) == ["signed:thumb/second.jpg"]
+
+
+def test_audio_waveforms_do_not_take_folder_image_preview_slots(real_db, seed, monkeypatch):
+    from apps.api.models.asset import AssetType, FileType
+    from apps.api.routers.share import _folder_thumbnail_urls
+    monkeypatch.setattr("apps.api.routers.share.generate_presigned_get_url", lambda key: "signed:" + key)
+    _preview(real_db, seed["deep"], "photo")
+    for index in range(4):
+        _, _, media = _preview(real_db, seed["shared"], f"audio-{index}", asset_type=AssetType.audio)
+        media.file_type = FileType.audio
+        media.mime_type = "audio/mpeg"
+        media.s3_key_thumbnail = f"waveforms/{index}.json"
+    real_db.flush()
+    assert _folder_thumbnail_urls(real_db, seed["shared"]) == ["signed:thumb/photo"]
+
+
 def test_empty_folder_preview_and_parent_cycle_terminate(real_db, seed, monkeypatch):
     from sqlalchemy import text
     from apps.api.routers.share import _folder_thumbnail_urls
