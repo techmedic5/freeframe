@@ -34,7 +34,7 @@ START_TTL = 300
 
 @lru_cache(maxsize=1)
 def archive_storage():
-    return _build_s3_client(Config(connect_timeout=5, read_timeout=15, retries={"total_max_attempts": 2}))
+    return _build_s3_client(Config(connect_timeout=5, read_timeout=15, retries={"total_max_attempts": 2, "mode": "standard"}))
 
 
 def safe_component(value):
@@ -217,10 +217,10 @@ def zip_chunks(files, open_file, check_access, completed):
             check_access(item)
             obj = open_file(item)
             body = obj["Body"]
-            size = obj["ContentLength"]
             count = 0
             checked = time.monotonic()
             try:
+                size = obj["ContentLength"]
                 with archive.open(item["path"], "w", force_zip64=True) as target:
                     yield from sink.drain()
                     while True:

@@ -125,7 +125,7 @@ def test_archive_collection_has_no_first_page_500_file_limit(real_db, seed, medi
 
 def test_sanitizes_paths_and_resolves_case_insensitive_collisions():
     used = set()
-    names = [archives.unique_component(n, used) for n in ("../CON.jpg", "a.jpg", "A.jpg", "..", "C:\\test.jpg", "NUL", "😀" * 200 + ".jpg")]
+    names = [archives.unique_component(n, used) for n in ("../CON.jpg", "a.jpg", "A.jpg", "..", "C:\\test.jpg", "NUL", "漢" * 200 + ".jpg")]
     assert len({name.casefold() for name in names}) == len(names)
     assert all("/" not in name and "\\" not in name and name not in (".", "..") for name in names)
     assert names[2] == "A (2).jpg"
@@ -159,6 +159,13 @@ def test_stream_checks_short_reads_and_closes_source():
     body = io.BytesIO(b"short")
     with pytest.raises(IOError):
         b"".join(archives.zip_chunks([{"path": "file.mp4"}], lambda item: {"Body": body, "ContentLength": 100}, lambda item: None, lambda: None))
+    assert body.closed
+
+
+def test_invalid_storage_response_still_closes_body():
+    body = io.BytesIO(b"abc")
+    with pytest.raises(KeyError):
+        b"".join(archives.zip_chunks([{"path": "file.mp4"}], lambda item: {"Body": body}, lambda item: None, lambda: None))
     assert body.closed
 
 
