@@ -35,8 +35,20 @@ def test_web_dockerfile_runs_base_path_guard():
 
     assert f'ENTRYPOINT ["{ENTRYPOINT}"]' in instructions
     assert 'CMD ["node", "server.js"]' in instructions
-    # The guard has to be installed executable, whatever the git mode is.
-    assert any(
-        re.match(rf"COPY --chmod=0?755 docker-entrypoint\.sh {re.escape(ENTRYPOINT)}$", line)
-        for line in instructions
-    )
+    # The guard has to be installed executable, whatever the git mode is, and
+    # without COPY --chmod, which the legacy (non-BuildKit) builder refuses.
+    assert not any("--chmod" in line for line in instructions)
+    copy = [
+        i
+        for i, line in enumerate(instructions)
+        if re.match(rf"COPY docker-entrypoint\.sh {re.escape(ENTRYPOINT)}$", line)
+    ]
+    chmod = [
+        i
+        for i, line in enumerate(instructions)
+        if re.match(rf"RUN chmod 0?755 {re.escape(ENTRYPOINT)}$", line)
+    ]
+    user = [i for i, line in enumerate(instructions) if line == "USER nextjs"]
+    assert len(copy) == 1 and len(chmod) == 1 and len(user) == 1
+    # chmod runs as root, after the copy and before the switch to nextjs.
+    assert copy[0] < chmod[0] < user[0]

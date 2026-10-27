@@ -40,7 +40,9 @@ COPY --from=builder --chown=nextjs:nodejs /app/.next/static ./.next/static
 # Refuses to start when NEXT_PUBLIC_BASE_PATH disagrees with the base path this
 # image was built for. Next fixes the base path at build time, so a published
 # root-path image given a sub-path would otherwise start and serve broken links.
-COPY --chmod=0755 docker-entrypoint.sh /usr/local/bin/ff-web-entrypoint
+# A plain COPY and a chmod, not COPY --chmod, so legacy (non-BuildKit) builds work.
+COPY docker-entrypoint.sh /usr/local/bin/ff-web-entrypoint
+RUN chmod 0755 /usr/local/bin/ff-web-entrypoint
 
 USER nextjs
 
