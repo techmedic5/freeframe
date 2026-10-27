@@ -1,4 +1,5 @@
 import io
+import asyncio
 import json
 import time
 import uuid
@@ -7,7 +8,9 @@ from datetime import datetime, timezone
 from unittest.mock import MagicMock
 
 import pytest
+import anyio
 from fastapi import HTTPException
+from starlette.requests import ClientDisconnect
 
 from apps.api.services import share_archives as archives
 from apps.api.tests.test_share_folder_scope import seed  # noqa: F401
@@ -253,3 +256,53 @@ def test_zip_cancellation_closes_open_storage_body():
     next(stream)
     stream.close()
     assert body.closed
+
+
+@pytest.mark.parametrize("spec_version", ["2.4", "2.0"])
+@pytest.mark.parametrize("failure", ["disconnect", "storage"])
+def test_response_failure_closes_body_and_releases_archive_slot(
+    real_db, seed, media, storage, monkeypatch, spec_version, failure,
+):
+    from apps.api.routers.share_archives import ArchiveResponse
+    link = seed["folder_link"]
+    job = archives.prepare_archive(real_db, link.token, None, None, None)
+    body = io.BytesIO(b"abc")
+    if failure == "storage":
+        monkeypatch.setattr(body, "read", MagicMock(side_effect=RuntimeError("storage interrupted")))
+    s3 = MagicMock()
+    s3.get_object.return_value = {"Body": body, "ContentLength": 3}
+    monkeypatch.setattr(archives, "archive_storage", lambda: s3)
+    monkeypatch.setattr(real_db, "rollback", lambda: None)
+    stream = archives.stream_archive(real_db, job, link.token, None, None)
+    response = ArchiveResponse(next(stream), stream, media_type="application/zip")
+
+    async def exercise():
+        first_body = anyio.Event()
+
+        async def receive():
+            if failure == "storage":
+                await anyio.sleep_forever()
+            await first_body.wait()
+            return {"type": "http.disconnect"}
+
+        async def send(message):
+            if message["type"] == "http.response.body" and failure == "disconnect":
+                if spec_version == "2.4":
+                    raise OSError("peer disconnected")
+                first_body.set()
+                await anyio.sleep_forever()
+
+        await response({"type": "http", "asgi": {"spec_version": spec_version}}, receive, send)
+
+    if failure == "storage":
+        with pytest.raises(RuntimeError, match="storage interrupted"):
+            asyncio.run(exercise())
+    elif spec_version == "2.4":
+        with pytest.raises(ClientDisconnect):
+            asyncio.run(exercise())
+    else:
+        asyncio.run(exercise())
+    assert body.closed
+    saved = json.loads(storage.get(archives.job_key(job["id"])))
+    assert saved["status"] == "failed"
+    assert not any(key.startswith("share_archive:slot:") for key in storage.values)

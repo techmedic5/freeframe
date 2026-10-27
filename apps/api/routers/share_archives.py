@@ -1,4 +1,4 @@
-import itertools
+import threading
 from typing import Optional
 from urllib.parse import quote
 import uuid
@@ -8,7 +8,8 @@ from fastapi.responses import StreamingResponse
 from fastapi.security import HTTPAuthorizationCredentials
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
-from starlette.background import BackgroundTask
+import anyio
+from starlette.concurrency import run_in_threadpool
 
 from ..database import get_db
 from ..middleware.auth import get_optional_user
@@ -22,6 +23,43 @@ router = APIRouter(tags=["sharing"])
 
 class ArchiveRequest(BaseModel):
     folder_id: Optional[uuid.UUID] = None
+
+
+class _ArchiveBody:
+    def __init__(self, first, stream):
+        self.first = first
+        self.stream = stream
+        self.lock = threading.Lock()
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        with self.lock:
+            if self.first is not None:
+                first, self.first = self.first, None
+                return first
+            return next(self.stream)
+
+    def close(self):
+        # A cancelled ASGI task can leave a storage read running in a worker.
+        # Serialize closing with next(), rather than closing an executing generator.
+        with self.lock:
+            self.stream.close()
+
+
+class ArchiveResponse(StreamingResponse):
+    def __init__(self, first, stream, **kwargs):
+        self.archive_body = _ArchiveBody(first, stream)
+        super().__init__(self.archive_body, **kwargs)
+
+    async def __call__(self, scope, receive, send):
+        try:
+            await super().__call__(scope, receive, send)
+        finally:
+            # BackgroundTask is skipped when streaming or ASGI send raises.
+            with anyio.CancelScope(shield=True):
+                await run_in_threadpool(self.archive_body.close)
 
 
 @router.post("/share/{token}/archives", dependencies=[Depends(rate_limit("share_archive", 2, 60))])
@@ -68,9 +106,8 @@ def download_share_archive(
         if isinstance(exc, HTTPException):
             raise
         raise HTTPException(503, job["error"])
-    return StreamingResponse(
-        itertools.chain((first,), stream), media_type="application/zip",
+    return ArchiveResponse(
+        first, stream, media_type="application/zip",
         headers={"Content-Disposition": "attachment; filename=\"download.zip\"; filename*=UTF-8''" + quote(job["filename"]),
                  "Cache-Control": "no-store", "X-Accel-Buffering": "no", "Accept-Ranges": "none"},
-        background=BackgroundTask(stream.close),
     )
