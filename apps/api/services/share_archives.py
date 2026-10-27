@@ -3,8 +3,10 @@ from collections import defaultdict, deque
 import hashlib
 from functools import lru_cache
 import json
+import logging
 import os
 import re
+import threading
 import time
 import unicodedata
 import uuid
@@ -12,6 +14,9 @@ import zipfile
 
 from fastapi import HTTPException
 from botocore.config import Config
+from redis import Redis, RedisError
+from redis.backoff import NoBackoff
+from redis.retry import Retry
 from sqlalchemy import or_
 
 from ..config import settings
@@ -24,12 +29,21 @@ from .permissions import (
     _is_descendant_of, folder_chain_is_live, validate_asset_in_share,
     validate_share_link_with_session,
 )
-from .redis_service import get_redis
 from .s3_service import _build_s3_client, build_download_filename
 
 CHUNK_SIZE = 256 * 1024
 JOB_TTL = 4 * 3600
 START_TTL = 300
+SLOT_LEASE_TTL = 90
+SLOT_REFRESH_INTERVAL = 20
+logger = logging.getLogger(__name__)
+
+
+@lru_cache(maxsize=1)
+def archive_redis():
+    return Redis.from_url(settings.redis_url, decode_responses=True,
+                          socket_connect_timeout=5, socket_timeout=5,
+                          retry=Retry(NoBackoff(), 0))
 
 
 @lru_cache(maxsize=1)
@@ -74,15 +88,30 @@ def job_key(job_id):
 
 
 def save_job(job):
-    saved = job if job["status"] not in ("complete", "failed") else dict(job, files=[])
-    get_redis().setex(job_key(job["id"]), JOB_TTL if job["status"] == "downloading" else START_TTL, json.dumps(saved))
+    saved = {key: value for key, value in job.items() if key != "files"}
+    redis = archive_redis()
+    redis.setex(job_key(job["id"]), JOB_TTL if job["status"] == "downloading" else START_TTL, json.dumps(saved))
+    if job["status"] in ("complete", "failed"):
+        redis.delete(job_key(job["id"]) + ":manifest")
 
 
 def load_job(job_id, token, session, user):
-    raw = get_redis().get(job_key(job_id))
-    job = json.loads(raw) if raw else None
-    if not job or job["owner"] != owner_key(token, session, user):
-        raise HTTPException(404, "ZIP download not found or expired")
+    redis = archive_redis()
+
+    def read_owned_job():
+        raw = redis.get(job_key(job_id))
+        current = json.loads(raw) if raw else None
+        if not current or current["owner"] != owner_key(token, session, user):
+            raise HTTPException(404, "ZIP download not found or expired")
+        return current
+
+    job = read_owned_job()
+    if job["status"] == "downloading" and job.get("slot") and redis.get(job["slot"]) != job["id"]:
+        # A completed stream may have saved its final status between these reads.
+        # Return inferred failure without overwriting a concurrent terminal update.
+        job = read_owned_job()
+        if job["status"] == "downloading":
+            job.update(status="failed", error="The server could not confirm this ZIP download. Check your browser's Downloads before trying again.")
     return job
 
 
@@ -159,15 +188,20 @@ def prepare_archive(db, token, session, user, folder_id):
     if len(assets) > settings.share_archive_max_files:
         raise HTTPException(413, "Too many files for one ZIP; download a smaller folder")
     files = []
+    live_folders = {}
+    allow_original = original_allowed_for_download(db, assets[0], user, None, True) if assets else False
     for asset in assets:
-        if asset.folder_id and not folder_chain_is_live(db, asset.folder_id):
-            continue
+        if asset.folder_id:
+            if asset.folder_id not in live_folders:
+                live_folders[asset.folder_id] = folder_chain_is_live(db, asset.folder_id)
+            if not live_folders[asset.folder_id]:
+                continue
         validate_asset_in_share(db, link, asset)
         media = _get_latest_media_file(db, asset.id)
         if not media:
-            raise HTTPException(409, "Some files are still processing; try again when they are ready")
+            raise HTTPException(409, "Some files are still processing, failed, or unavailable; ask the owner to check them before downloading the full ZIP")
         choice = pick_or_refuse(asset, media, None, prefer_original=True,
-            allow_original=original_allowed_for_download(db, asset, user, None, True))
+            allow_original=allow_original)
         parent = paths.get(asset.folder_id, "")
         filename = build_download_filename(asset.name, choice.s3_key, media.original_filename)
         if choice.id == "transcode":
@@ -183,6 +217,7 @@ def prepare_archive(db, token, session, user, folder_id):
            "status": "ready", "created_at": time.time(), "files": files,
            "filename": safe_component(link.title or "Shared media") + ".zip",
            "file_count": len(files), "completed_files": 0, "error": None}
+    archive_redis().setex(job_key(job["id"]) + ":manifest", START_TTL, json.dumps(files))
     save_job(job)
     return job
 
@@ -190,6 +225,72 @@ def prepare_archive(db, token, session, user, folder_id):
 def fail_job(job, message):
     job.update(status="failed", error=message)
     save_job(job)
+
+
+def _save_stream_status(job):
+    attempts = 3 if job["status"] in ("complete", "failed") else 1
+    for attempt in range(attempts):
+        try:
+            save_job(job)
+            return
+        except RedisError:
+            if attempt + 1 < attempts:
+                time.sleep(0.1 * 2 ** attempt)
+    # Progress outages must not truncate a valid ZIP or prevent lease cleanup.
+    logger.warning("Could not update ZIP download status for %s", job["id"])
+
+
+class _StreamLease:
+    def __init__(self, redis, key, owner, acquired_at=None):
+        self.redis, self.key, self.owner = redis, key, owner
+        acquired_at = time.monotonic() if acquired_at is None else acquired_at
+        self.deadline = acquired_at + SLOT_LEASE_TTL
+        self.expires_at = acquired_at + JOB_TTL
+        self.stopped = threading.Event()
+        self.lost = threading.Event()
+        self.thread = threading.Thread(target=self._heartbeat, daemon=True)
+
+    def start(self):
+        self.thread.start()
+
+    def _renew(self):
+        began = time.monotonic()
+        try:
+            renewed = self.redis.eval(
+                "if redis.call('get', KEYS[1]) == ARGV[1] then return redis.call('expire', KEYS[1], ARGV[2]) end return 0",
+                1, self.key, self.owner, SLOT_LEASE_TTL,
+            )
+        except RedisError:
+            return
+        if renewed:
+            self.deadline = began + SLOT_LEASE_TTL
+        else:
+            self.lost.set()
+
+    def _heartbeat(self):
+        # Renew even while the browser applies backpressure and iteration is paused.
+        while not self.stopped.wait(SLOT_REFRESH_INTERVAL):
+            if time.monotonic() >= min(self.deadline, self.expires_at):
+                self.lost.set()
+                return
+            self._renew()
+            if self.lost.is_set():
+                return
+
+    def check(self):
+        if self.lost.is_set() or time.monotonic() >= min(self.deadline, self.expires_at):
+            raise HTTPException(503, "ZIP download lost its server slot; please try again")
+
+    def close(self):
+        self.stopped.set()
+        try:
+            self.redis.eval(
+                "if redis.call('get', KEYS[1]) == ARGV[1] then return redis.call('del', KEYS[1]) end return 0",
+                1, self.key, self.owner,
+            )
+        except RedisError:
+            # The short lease recovers capacity if Redis is unavailable during cleanup.
+            logger.warning("Could not release ZIP download slot for %s", self.owner)
 
 
 class _Sink:
@@ -246,27 +347,40 @@ def zip_chunks(files, open_file, check_access, completed):
 
 def stream_archive(db, job, token, session, user):
     from ..routers.share import _get_latest_media_file
-    redis = get_redis()
+    redis = archive_redis()
     if job["status"] != "ready" or time.time() - job["created_at"] > START_TTL:
         raise HTTPException(409, "This ZIP request has expired or already started; try again")
+    raw = redis.get(job_key(job["id"]) + ":manifest")
+    if raw is None:
+        raise HTTPException(409, "This ZIP request has expired; prepare a new download")
+    files = json.loads(raw)
     if not redis.set(job_key(job["id"]) + ":started", "1", nx=True, ex=JOB_TTL):
         raise HTTPException(409, "This ZIP download has already started")
     slot = None
     for index in range(settings.share_archive_max_streams):
         key = "share_archive:slot:" + str(index)
-        if redis.set(key, job["id"], nx=True, ex=JOB_TTL):
+        acquired_at = time.monotonic()
+        if redis.set(key, job["id"], nx=True, ex=SLOT_LEASE_TTL):
             slot = key
             break
     if slot is None:
         fail_job(job, "The server is busy downloading ZIPs; try again shortly")
         raise HTTPException(429, job["error"])
-    job.update(status="downloading")
-    save_job(job)
+    lease = _StreamLease(redis, slot, job["id"], acquired_at)
+    try:
+        lease.start()
+        job.update(status="downloading", slot=slot)
+        save_job(job)
+        redis.delete(job_key(job["id"]) + ":manifest")
+    except BaseException:
+        lease.close()
+        raise
     actor_id = user.id if user else None
     token_version = user.token_version if user else None
     started = time.monotonic()
 
     def check(item):
+        lease.check()
         if time.monotonic() - started >= JOB_TTL:
             raise HTTPException(408, "ZIP download timed out; download a smaller folder")
         db.expire_all()
@@ -294,20 +408,34 @@ def stream_archive(db, job, token, session, user):
 
     def completed():
         job["completed_files"] += 1
-        save_job(job)
+        _save_stream_status(job)
 
     def stream():
+        chunks = zip_chunks(files, lambda item: archive_storage().get_object(
+            Bucket=settings.s3_bucket, Key=item["key"]), check, completed)
         try:
-            yield from zip_chunks(job["files"], lambda item: archive_storage().get_object(
-                Bucket=settings.s3_bucket, Key=item["key"]), check, completed)
+            while True:
+                # Check before advancing, including after a long backpressure pause.
+                lease.check()
+                try:
+                    chunk = next(chunks)
+                except StopIteration:
+                    break
+                lease.check()
+                yield chunk
             job.update(status="complete")
-            save_job(job)
+            _save_stream_status(job)
         except GeneratorExit:
-            fail_job(job, "ZIP download was interrupted; please try again")
+            job.update(status="failed", error="ZIP download was interrupted; please try again")
+            _save_stream_status(job)
             raise
         except Exception as exc:
-            fail_job(job, exc.detail if isinstance(exc, HTTPException) else "ZIP download failed; please try again")
+            job.update(status="failed", error=exc.detail if isinstance(exc, HTTPException) else "ZIP download failed; please try again")
+            _save_stream_status(job)
             raise
         finally:
-            redis.eval("if redis.call('get', KEYS[1]) == ARGV[1] then return redis.call('del', KEYS[1]) end return 0", 1, slot, job["id"])
+            try:
+                chunks.close()
+            finally:
+                lease.close()
     return stream()

@@ -1,6 +1,7 @@
 import io
 import asyncio
 import json
+import threading
 import time
 import uuid
 import zipfile
@@ -10,6 +11,7 @@ from unittest.mock import MagicMock
 import pytest
 import anyio
 from fastapi import HTTPException
+from redis import RedisError
 from starlette.requests import ClientDisconnect
 
 from apps.api.services import share_archives as archives
@@ -19,28 +21,61 @@ from apps.api.tests.test_share_folder_scope import seed  # noqa: F401
 class MemoryRedis:
     def __init__(self):
         self.values = {}
+        self.expires = {}
+        self.clock = time.monotonic
+        self.lock = threading.RLock()
+        self.writes = []
+        self.reads = []
+        self.renewed = threading.Event()
+
+    def _expire(self, key):
+        if key in self.expires and self.expires[key] <= self.clock():
+            self.delete(key)
 
     def get(self, key):
-        return self.values.get(key)
+        with self.lock:
+            self.reads.append(key)
+            self._expire(key)
+            return self.values.get(key)
 
     def setex(self, key, seconds, value):
-        self.values[key] = value
+        with self.lock:
+            self.writes.append((key, len(value)))
+            self.values[key] = value
+            self.expires[key] = self.clock() + seconds
 
     def set(self, key, value, nx=False, ex=None):
-        if nx and key in self.values:
-            return False
-        self.values[key] = value
-        return True
+        with self.lock:
+            self._expire(key)
+            if nx and key in self.values:
+                return False
+            self.values[key] = value
+            if ex:
+                self.expires[key] = self.clock() + ex
+            return True
 
-    def eval(self, script, count, key, value):
-        if self.values.get(key) == value:
-            del self.values[key]
+    def delete(self, key):
+        with self.lock:
+            self.values.pop(key, None)
+            self.expires.pop(key, None)
+
+    def eval(self, script, count, key, value, *args):
+        with self.lock:
+            self._expire(key)
+            if self.values.get(key) != value:
+                return 0
+            if args:
+                self.expires[key] = self.clock() + args[0]
+                self.renewed.set()
+            else:
+                self.delete(key)
+            return 1
 
 
 @pytest.fixture
 def storage(monkeypatch):
     redis = MemoryRedis()
-    monkeypatch.setattr(archives, "get_redis", lambda: redis)
+    monkeypatch.setattr(archives, "archive_redis", lambda: redis)
     monkeypatch.setattr("apps.api.services.downloads.get_allow_original_downloads", lambda db: True)
     return redis
 
@@ -112,7 +147,7 @@ def test_prepare_excludes_deleted_ancestor_and_respects_original_policy(real_db,
     assert job["files"][0]["key"] == "processed/in-shared/download.mp4"
 
 
-def test_archive_collection_has_no_first_page_500_file_limit(real_db, seed, media):
+def test_archive_collection_has_no_first_page_500_file_limit(real_db, seed, media, storage, monkeypatch):
     from apps.api.models.asset import Asset, AssetType, AssetVersion, MediaFile, FileType, ProcessingStatus
     folder = seed["shared"]
     for i in range(501):
@@ -122,8 +157,44 @@ def test_archive_collection_has_no_first_page_500_file_limit(real_db, seed, medi
         real_db.add(version); real_db.flush()
         real_db.add(MediaFile(version_id=version.id, file_type=FileType.image, original_filename=f"{i}.jpg", mime_type="image/jpeg", file_size_bytes=1, s3_key_raw=f"raw/{i}.jpg"))
     real_db.flush()
+    policy = MagicMock(wraps=archives.original_allowed_for_download)
+    authorization = MagicMock(wraps=archives.validate_asset_in_share)
+    liveness = MagicMock(wraps=archives.folder_chain_is_live)
+    monkeypatch.setattr(archives, "original_allowed_for_download", policy)
+    monkeypatch.setattr(archives, "validate_asset_in_share", authorization)
+    monkeypatch.setattr(archives, "folder_chain_is_live", liveness)
     job = archives.prepare_archive(real_db, seed["folder_link"].token, None, None, None)
     assert len(job["files"]) == 503
+    policy.assert_called_once()
+    assert authorization.call_count == 503
+    assert liveness.call_count == 3  # Requested root, then each of the two asset folders.
+    key = archives.job_key(job["id"])
+    manifest = key + ":manifest"
+    for count in range(1, 504):
+        job.update(status="downloading", completed_files=count)
+        archives.save_job(job)
+        status = archives.load_job(job["id"], seed["folder_link"].token, None, None)
+        assert status["completed_files"] == count
+        assert "files" not in status
+    assert len([size for name, size in storage.writes if name == manifest]) == 1
+    assert max(size for name, size in storage.writes if name == key) < 1024
+    assert manifest not in storage.reads
+
+
+@pytest.mark.parametrize("status", ["processing", "failed", "missing"])
+def test_unavailable_media_refuses_partial_zip_with_accurate_message(real_db, seed, media, storage, status):
+    from apps.api.models.asset import ProcessingStatus
+    _, version, file = media["in-shared"]
+    if status == "missing":
+        real_db.delete(file)
+    else:
+        version.processing_status = ProcessingStatus(status)
+    real_db.flush()
+    with pytest.raises(HTTPException) as exc:
+        archives.prepare_archive(real_db, seed["folder_link"].token, None, None, None)
+    assert exc.value.status_code == 409
+    assert "processing, failed, or unavailable" in exc.value.detail
+    assert not storage.values
 
 
 def test_sanitizes_paths_and_resolves_case_insensitive_collisions():
@@ -185,6 +256,7 @@ def test_job_status_is_bound_to_session_and_user(storage):
 def test_stream_rechecks_revocation_and_releases_slot(real_db, seed, media, storage):
     link = seed["folder_link"]
     job = archives.prepare_archive(real_db, link.token, None, None, None)
+    job = archives.load_job(job["id"], link.token, None, None)
     link.allow_download = False
     real_db.flush()
     stream = archives.stream_archive(real_db, job, link.token, None, None)
@@ -211,6 +283,8 @@ def test_stream_policies_rechecked_when_original_setting_changes(real_db, seed, 
 def test_stream_emits_valid_zip_once_and_clears_manifest(real_db, seed, media, storage, monkeypatch):
     link = seed["folder_link"]
     job = archives.prepare_archive(real_db, link.token, None, None, None)
+    job = archives.load_job(job["id"], link.token, None, None)
+    assert "files" not in job
     s3 = MagicMock()
     s3.get_object.side_effect = lambda **kwargs: {"Body": io.BytesIO(b"abc"), "ContentLength": 3}
     monkeypatch.setattr(archives, "archive_storage", lambda: s3)
@@ -223,7 +297,8 @@ def test_stream_emits_valid_zip_once_and_clears_manifest(real_db, seed, media, s
         assert all(archive.read(name) == b"abc" for name in archive.namelist())
     saved = json.loads(storage.get(archives.job_key(job["id"])))
     assert saved["status"] == "complete"
-    assert saved["completed_files"] == 2 and saved["files"] == []
+    assert saved["completed_files"] == 2 and "files" not in saved
+    assert storage.get(archives.job_key(job["id"]) + ":manifest") is None
     with pytest.raises(HTTPException) as e:
         archives.stream_archive(real_db, saved, link.token, None, None)
     assert e.value.status_code == 409
@@ -256,6 +331,200 @@ def test_zip_cancellation_closes_open_storage_body():
     next(stream)
     stream.close()
     assert body.closed
+
+
+def test_startup_redis_failure_releases_slot_and_stops_heartbeat(real_db, seed, media, storage, monkeypatch):
+    link = seed["folder_link"]
+    job = archives.prepare_archive(real_db, link.token, None, None, None)
+    leases = []
+    start = archives._StreamLease.start
+
+    def record_start(lease):
+        leases.append(lease)
+        start(lease)
+
+    monkeypatch.setattr(archives._StreamLease, "start", record_start)
+    monkeypatch.setattr(archives, "save_job", MagicMock(side_effect=RedisError("temporarily unavailable")))
+    with pytest.raises(RedisError):
+        archives.stream_archive(real_db, job, link.token, None, None)
+    assert len(leases) == 1
+    leases[0].thread.join(timeout=1)
+    assert not leases[0].thread.is_alive()
+    assert not any(key.startswith("share_archive:slot:") for key in storage.values)
+
+
+def test_abandoned_slot_recovers_after_short_lease_and_old_owner_cannot_release_or_renew(storage):
+    now = [0]
+    storage.clock = lambda: now[0]
+    key = "share_archive:slot:0"
+    storage.set(key, "crashed", nx=True, ex=archives.SLOT_LEASE_TTL)
+    abandoned = archives._StreamLease(storage, key, "crashed")
+    now[0] += archives.SLOT_LEASE_TTL + 1
+    assert storage.set(key, "replacement", nx=True, ex=archives.SLOT_LEASE_TTL)
+    expiry = storage.expires[key]
+    now[0] += 1
+    abandoned._renew()
+    with pytest.raises(HTTPException) as exc:
+        abandoned.check()
+    assert exc.value.status_code == 503
+    abandoned.close()
+    assert storage.get(key) == "replacement"
+    assert storage.expires[key] == expiry
+
+
+def test_lease_redis_outage_stops_stream_after_last_confirmed_expiry(storage, monkeypatch):
+    key = "share_archive:slot:0"
+    storage.set(key, "job", nx=True, ex=archives.SLOT_LEASE_TTL)
+    lease = archives._StreamLease(storage, key, "job")
+    monkeypatch.setattr(storage, "eval", MagicMock(side_effect=RedisError("offline")))
+    lease._renew()
+    lease.check()
+    lease.deadline = time.monotonic() - 1
+    with pytest.raises(HTTPException):
+        lease.check()
+    lease.close()  # Cleanup outages do not mask the original streaming error.
+
+
+def test_backpressure_keeps_lease_alive_then_lost_ownership_closes_body(
+    real_db, seed, media, storage, monkeypatch,
+):
+    link = seed["folder_link"]
+    job = archives.prepare_archive(real_db, link.token, None, None, None)
+    body = io.BytesIO(b"abc")
+    read = MagicMock(wraps=body.read)
+    monkeypatch.setattr(body, "read", read)
+    s3 = MagicMock()
+    s3.get_object.return_value = {"Body": body, "ContentLength": 3}
+    monkeypatch.setattr(archives, "archive_storage", lambda: s3)
+    monkeypatch.setattr(real_db, "rollback", lambda: None)
+    monkeypatch.setattr(archives, "SLOT_REFRESH_INTERVAL", 0.01)
+    leases = []
+    start = archives._StreamLease.start
+
+    def record_start(lease):
+        leases.append(lease)
+        start(lease)
+
+    monkeypatch.setattr(archives._StreamLease, "start", record_start)
+    now = [0]
+    storage.clock = lambda: now[0]
+    stream = archives.stream_archive(real_db, job, link.token, None, None)
+    assert next(stream).startswith(b"PK")
+    key = next(key for key in storage.values if key.startswith("share_archive:slot:"))
+    try:
+        for _ in range(6):
+            storage.renewed.clear()
+            now[0] += 20
+            assert storage.renewed.wait(timeout=1)
+            assert storage.get(key) == job["id"]
+        assert now[0] > archives.SLOT_LEASE_TTL
+        read.assert_not_called()  # No generator advancement while the client is paused.
+        storage.set(key, "replacement", ex=archives.SLOT_LEASE_TTL)
+        assert leases[0].lost.wait(timeout=1)
+        with pytest.raises(HTTPException) as exc:
+            next(stream)
+        assert exc.value.status_code == 503
+        read.assert_not_called()
+        assert body.closed
+        assert storage.get(key) == "replacement"
+        assert archives.load_job(job["id"], link.token, None, None)["status"] == "failed"
+    finally:
+        stream.close()
+        leases[0].thread.join(timeout=1)
+        assert not leases[0].thread.is_alive()
+
+
+def test_transient_progress_write_failure_does_not_truncate_zip(real_db, seed, media, storage, monkeypatch):
+    link = seed["folder_link"]
+    job = archives.prepare_archive(real_db, link.token, None, None, None)
+    s3 = MagicMock()
+    s3.get_object.side_effect = lambda **kwargs: {"Body": io.BytesIO(b"abc"), "ContentLength": 3}
+    monkeypatch.setattr(archives, "archive_storage", lambda: s3)
+    monkeypatch.setattr(real_db, "rollback", lambda: None)
+    save = archives.save_job
+    failed = []
+
+    def fail_first_progress(current):
+        if current["status"] == "downloading" and current["completed_files"] == 1 and not failed:
+            failed.append(True)
+            raise RedisError("transient progress failure")
+        save(current)
+
+    monkeypatch.setattr(archives, "save_job", fail_first_progress)
+    data = b"".join(archives.stream_archive(real_db, job, link.token, None, None))
+    with zipfile.ZipFile(io.BytesIO(data)) as archive:
+        assert len(archive.namelist()) == 2
+        assert archive.testzip() is None
+    assert failed
+    assert archives.load_job(job["id"], link.token, None, None)["status"] == "complete"
+
+
+@pytest.mark.parametrize("status", ["complete", "failed"])
+def test_terminal_status_retries_transient_redis_error(storage, monkeypatch, status):
+    job = {"id": str(uuid.uuid4()), "owner": archives.owner_key("token", None, None), "status": "downloading"}
+    archives.save_job(job)
+    save = archives.save_job
+    attempts = []
+
+    def fail_once(current):
+        attempts.append(current["status"])
+        if len(attempts) == 1:
+            raise RedisError("terminal write interrupted")
+        save(current)
+
+    monkeypatch.setattr(archives, "save_job", fail_once)
+    job["status"] = status
+    archives._save_stream_status(job)
+    assert attempts == [status, status]
+    assert archives.load_job(job["id"], "token", None, None)["status"] == status
+
+
+def test_terminal_status_retries_are_bounded_and_do_not_mask_stream_result(storage, monkeypatch):
+    save = MagicMock(side_effect=RedisError("still offline"))
+    monkeypatch.setattr(archives, "save_job", save)
+    archives._save_stream_status({"id": str(uuid.uuid4()), "status": "complete"})
+    assert save.call_count == 3
+
+
+@pytest.mark.parametrize("new_owner", [None, "replacement"])
+def test_status_recovers_after_terminal_write_outage_or_worker_crash(storage, monkeypatch, new_owner):
+    key = "share_archive:slot:0"
+    job = {"id": str(uuid.uuid4()), "owner": archives.owner_key("token", None, None),
+           "status": "downloading", "slot": key}
+    storage.set(key, job["id"], ex=archives.SLOT_LEASE_TTL)
+    archives.save_job(job)
+    assert archives.load_job(job["id"], "token", None, None)["status"] == "downloading"
+    with monkeypatch.context() as patch:
+        patch.setattr(archives, "save_job", MagicMock(side_effect=RedisError("offline")))
+        job["status"] = "complete"
+        archives._save_stream_status(job)
+    storage.delete(key)
+    if new_owner:
+        storage.set(key, new_owner, ex=archives.SLOT_LEASE_TTL)
+    status = archives.load_job(job["id"], "token", None, None)
+    assert status["status"] == "failed"
+    assert "Check your browser's Downloads" in status["error"]
+    # Reconciliation must not invent completion or overwrite future terminal writes.
+    assert json.loads(storage.get(archives.job_key(job["id"])))["status"] == "downloading"
+    assert storage.get(key) == new_owner
+
+
+def test_status_preserves_completion_saved_between_job_and_lease_reads(storage, monkeypatch):
+    key = "share_archive:slot:0"
+    job = {"id": str(uuid.uuid4()), "owner": archives.owner_key("token", None, None),
+           "status": "downloading", "slot": key}
+    archives.save_job(job)
+    get = storage.get
+
+    def finish_before_lease_read(name):
+        if name == key:
+            job["status"] = "complete"
+            archives.save_job(job)
+        return get(name)
+
+    monkeypatch.setattr(storage, "get", finish_before_lease_read)
+    assert archives.load_job(job["id"], "token", None, None)["status"] == "complete"
+    assert json.loads(get(archives.job_key(job["id"])))["status"] == "complete"
 
 
 @pytest.mark.parametrize("spec_version", ["2.4", "2.0"])
