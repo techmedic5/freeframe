@@ -95,6 +95,9 @@ class Settings(BaseSettings):
     # Note: S3 multipart still caps effective size at ~10,000 parts x chunk size.
     max_upload_bytes: int = 0
 
+    share_archive_max_files: int = Field(10000, ge=1, le=100000)
+    share_archive_max_streams: int = Field(2, ge=1, le=32)
+
     # Reaper: uploads stuck in `uploading`/`failed` longer than this are reclaimed. Hours.
     # A `failed` version whose master is still in storage (a transcode that failed)
     # is kept.

@@ -8,8 +8,26 @@ although streaming an asset from it was already refused by
 folder item or a descendant of one.
 """
 import uuid
+from datetime import datetime, timezone
 
 import pytest
+
+
+def _preview(real_db, folder, name="preview", **asset_fields):
+    from apps.api.models.asset import Asset, AssetType, AssetVersion, FileType, MediaFile, ProcessingStatus
+    fields = dict(project_id=folder.project_id, folder_id=folder.id,
+                  created_by=folder.created_by, name=name, asset_type=AssetType.image)
+    fields.update(asset_fields)
+    asset = Asset(**fields)
+    real_db.add(asset); real_db.flush()
+    version = AssetVersion(asset_id=asset.id, version_number=1, created_by=folder.created_by,
+                           processing_status=ProcessingStatus.ready)
+    real_db.add(version); real_db.flush()
+    media = MediaFile(version_id=version.id, file_type=FileType.image, original_filename=name + ".jpg",
+                      mime_type="image/jpeg", file_size_bytes=100, s3_key_raw="raw/" + name,
+                      s3_key_thumbnail="thumb/" + name)
+    real_db.add(media); real_db.flush()
+    return asset, version, media
 
 
 def _folder(real_db, project, owner, name, parent=None):
@@ -148,3 +166,146 @@ def test_project_link_without_items_lists_any_folder_of_its_project(real_db, see
 
 def test_project_link_refuses_a_folder_of_another_project(real_db, seed):
     assert _refused(real_db, seed["project_link"], seed["other"].id) == "Folder is not within the shared project"
+
+
+@pytest.mark.parametrize("link_name,card", [
+    ("project_link", "shared"), ("multi", "shared"), ("folder_link", "sub"),
+])
+def test_shared_folder_previews_include_nested_media(real_db, seed, monkeypatch, link_name, card):
+    monkeypatch.setattr("apps.api.routers.share.generate_presigned_get_url", lambda key: "signed:" + key)
+    _preview(real_db, seed["deep"])
+    response = _list(real_db, seed[link_name], None)
+    folder = next(f for f in response.subfolders if f.name == card)
+    assert folder.thumbnail_urls == ["signed:thumb/preview"]
+
+
+@pytest.mark.parametrize("excluded", ["sibling", "other", "deleted_branch", "deleted_asset", "foreign_asset", "foreign_folder"])
+def test_nested_previews_exclude_unshared_deleted_and_foreign_media(real_db, seed, monkeypatch, excluded):
+    from apps.api.models.folder import Folder
+    from apps.api.routers.share import _folder_thumbnail_urls
+    monkeypatch.setattr("apps.api.routers.share.generate_presigned_get_url", lambda key: "signed:" + key)
+    _preview(real_db, seed["sub"], "visible")
+    if excluded in ("sibling", "other"):
+        _preview(real_db, seed[excluded], "hidden")
+    elif excluded == "deleted_branch":
+        seed["deep"].deleted_at = datetime.now(timezone.utc)
+        child = Folder(project_id=seed["deep"].project_id, parent_id=seed["deep"].id,
+                       name="below-trash", created_by=seed["deep"].created_by)
+        real_db.add(child); real_db.flush()
+        _preview(real_db, child, "hidden")
+    elif excluded == "deleted_asset":
+        _preview(real_db, seed["deep"], "hidden", deleted_at=datetime.now(timezone.utc))
+    elif excluded == "foreign_asset":
+        _preview(real_db, seed["deep"], "hidden", project_id=seed["other"].project_id)
+    else:
+        seed["other"].parent_id = seed["shared"].id
+        _preview(real_db, seed["other"], "hidden")
+    real_db.flush()
+    assert _folder_thumbnail_urls(real_db, seed["shared"]) == ["signed:thumb/visible"]
+
+
+def test_folder_previews_keep_direct_media_first_and_limit_to_four(real_db, seed, monkeypatch):
+    from apps.api.routers.share import _folder_thumbnail_urls
+    monkeypatch.setattr("apps.api.routers.share.generate_presigned_get_url", lambda key: "signed:" + key)
+    _preview(real_db, seed["shared"], "direct")
+    for i in range(6):
+        _preview(real_db, seed["deep"], f"nested-{i}")
+    urls = _folder_thumbnail_urls(real_db, seed["shared"])
+    assert len(urls) == 4
+    assert urls[0] == "signed:thumb/direct"
+
+
+@pytest.mark.parametrize("missing_thumbnail", [None, ""])
+def test_carousel_preview_uses_later_media_with_a_thumbnail(real_db, seed, monkeypatch, missing_thumbnail):
+    from apps.api.models.asset import AssetType, FileType, MediaFile
+    from apps.api.routers.share import _folder_thumbnail_urls
+    monkeypatch.setattr("apps.api.routers.share.generate_presigned_get_url", lambda key: "signed:" + key)
+    _, version, first = _preview(real_db, seed["deep"], "carousel", asset_type=AssetType.image_carousel)
+    first.id = uuid.UUID(int=1)
+    first.s3_key_thumbnail = missing_thumbnail
+    real_db.add(MediaFile(
+        id=uuid.UUID(int=2), version_id=version.id, file_type=FileType.image,
+        original_filename="second.jpg", mime_type="image/jpeg", file_size_bytes=100,
+        s3_key_raw="raw/second.jpg", s3_key_thumbnail="thumb/second.jpg",
+    ))
+    real_db.flush()
+    assert _folder_thumbnail_urls(real_db, seed["shared"]) == ["signed:thumb/second.jpg"]
+
+
+def test_audio_waveforms_do_not_take_folder_image_preview_slots(real_db, seed, monkeypatch):
+    from apps.api.models.asset import AssetType, FileType
+    from apps.api.routers.share import _folder_thumbnail_urls
+    monkeypatch.setattr("apps.api.routers.share.generate_presigned_get_url", lambda key: "signed:" + key)
+    _preview(real_db, seed["deep"], "photo")
+    for index in range(4):
+        _, _, media = _preview(real_db, seed["shared"], f"audio-{index}", asset_type=AssetType.audio)
+        media.file_type = FileType.audio
+        media.mime_type = "audio/mpeg"
+        media.s3_key_thumbnail = f"waveforms/{index}.json"
+    real_db.flush()
+    assert _folder_thumbnail_urls(real_db, seed["shared"]) == ["signed:thumb/photo"]
+
+
+def test_empty_folder_preview_and_parent_cycle_terminate(real_db, seed, monkeypatch):
+    from sqlalchemy import text
+    from apps.api.routers.share import _folder_thumbnail_urls
+    monkeypatch.setattr("apps.api.routers.share.generate_presigned_get_url", lambda key: "signed:" + key)
+    assert _folder_thumbnail_urls(real_db, seed["shared"]) == []
+    _preview(real_db, seed["deep"])
+    seed["shared"].parent_id = seed["deep"].id
+    real_db.flush()
+    real_db.execute(text("SET LOCAL statement_timeout = '2s'"))
+    assert _folder_thumbnail_urls(real_db, seed["shared"]) == ["signed:thumb/preview"]
+
+
+def test_missing_or_unready_thumbnails_do_not_hide_available_previews(real_db, seed, monkeypatch):
+    from apps.api.models.asset import ProcessingStatus
+    from apps.api.routers.share import _folder_thumbnail_urls
+    monkeypatch.setattr("apps.api.routers.share.generate_presigned_get_url", lambda key: "signed:" + key)
+    _preview(real_db, seed["deep"], "visible")
+    for i in range(5):
+        _, version, media = _preview(real_db, seed["shared"], f"missing-{i}")
+        if i == 0:
+            media.s3_key_thumbnail = None
+        elif i == 1:
+            media.s3_key_thumbnail = ""
+        elif i == 2:
+            version.deleted_at = datetime.now(timezone.utc)
+        else:
+            version.processing_status = ProcessingStatus.processing
+    real_db.flush()
+    assert _folder_thumbnail_urls(real_db, seed["shared"]) == ["signed:thumb/visible"]
+
+
+def test_multi_share_preview_hides_media_below_a_deleted_ancestor(real_db, seed, monkeypatch):
+    monkeypatch.setattr("apps.api.routers.share.generate_presigned_get_url", lambda key: "signed:" + key)
+    _preview(real_db, seed["deep"])
+    seed["shared"].parent_id = seed["sibling"].id
+    seed["sibling"].deleted_at = datetime.now(timezone.utc)
+    real_db.flush()
+    response = _list(real_db, seed["multi"], None)
+    assert all(not folder.thumbnail_urls for folder in response.subfolders)
+
+
+@pytest.mark.parametrize("new_status,deleted,thumbnail,expected", [
+    ("uploading", False, "new", "preview"),
+    ("failed", False, "new", "preview"),
+    ("ready", True, "new", "preview"),
+    ("ready", False, "new", "new"),
+    ("ready", False, None, None),
+])
+def test_folder_preview_uses_only_latest_live_ready_version(real_db, seed, monkeypatch,
+                                                         new_status, deleted, thumbnail, expected):
+    from apps.api.models.asset import AssetVersion, FileType, MediaFile, ProcessingStatus
+    from apps.api.routers.share import _folder_thumbnail_urls
+    monkeypatch.setattr("apps.api.routers.share.generate_presigned_get_url", lambda key: "signed:" + key)
+    asset, _, _ = _preview(real_db, seed["deep"])
+    version = AssetVersion(asset_id=asset.id, version_number=2, created_by=asset.created_by,
+                           processing_status=ProcessingStatus(new_status),
+                           deleted_at=datetime.now(timezone.utc) if deleted else None)
+    real_db.add(version); real_db.flush()
+    real_db.add(MediaFile(version_id=version.id, file_type=FileType.image, original_filename="new.jpg",
+                          mime_type="image/jpeg", file_size_bytes=100, s3_key_raw="raw/new",
+                          s3_key_thumbnail="thumb/" + thumbnail if thumbnail else None))
+    real_db.flush()
+    assert _folder_thumbnail_urls(real_db, seed["shared"]) == (["signed:thumb/" + expected] if expected else [])

@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- Guest **Download All** streams one ZIP containing the current folder and its nested folders, with visible progress/errors and the existing original-download policy. It includes all matching files rather than only the first page.
+- Guest viewers have Previous/Next controls and touch swipes between assets in gallery search/sort order, including unloaded pages. Swipes leave zoomed photos, drawing, image carousels and video seeking alone.
+
+### Fixed
+- Shared folder cards show thumbnails from nested folders, so folders that organize media into subfolders no longer appear empty. Direct files remain first, and previews stay within the folder's live project subtree.
+
 ## [1.21.0] - 2026-10-24
 
 Folder uploads and a project settings page. Drop a folder, or choose Upload folder, and its files upload with the folder tree recreated; a project's owner now edits its details, members and share page branding on one settings page, and every kind of share link shows the project's logo, colour and footer. The web app moves to Next.js 16 and React 19, leaving the Next.js 14 line, which no longer gets security fixes (see Security). This release also adds settings for the S3 storage class and the audio bitrate of review streams, transcodes portrait video at its own size, and carries fixes to uploads, compare, invites, sign-in and production logging.

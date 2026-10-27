@@ -24,10 +24,10 @@ import { useShareAppearance } from '@/hooks/use-share-appearance'
 import { withBasePath } from '@/lib/base-path'
 import { useReview, type CreateCommentPayload } from '@/components/review/review-provider'
 import { useReviewStore } from '@/stores/review-store'
-import { fetchDownloadUrl, fetchShareDownloadOptions, handleDownload, triggerDownload } from './share-download'
+import { downloadShareArchive, fetchShareDownloadOptions, handleDownload, type ShareArchiveStatus } from './share-download'
 import { DownloadMenu } from '@/components/shared/download-menu'
 import { CommentCountBadge } from '@/components/shared/comment-count-badge'
-import { ShareReviewScreen } from './share-review-screen'
+import { ShareReviewScreen, type ShareAssetNavigation } from './share-review-screen'
 import { ShareBrandMark } from './share-brand-mark'
 import { usePageTitle } from '@/hooks/use-page-title'
 import { SHARE_ASSETS_PAGE_SIZE } from '@/lib/share-page'
@@ -124,51 +124,6 @@ function getAssetTypeBadgeLabel(assetType: string): string {
 
 
 
-
-async function collectAllAssetsRecursive(
-  token: string,
-  folderId: string | null,
-  shareSession?: string | null,
-): Promise<{ id: string; name: string }[]> {
-  // Fetch assets + subfolders at this level, then recurse into subfolders.
-  const sp = shareSession ? `&share_session=${encodeURIComponent(shareSession)}` : ''
-  const folderParam = folderId ? `folder_id=${folderId}&` : ''
-  try {
-    const res = await fetch(`${API_URL}/share/${token}/assets?${folderParam}page=1&per_page=500${sp}`)
-    if (!res.ok) return []
-    const data = await res.json() as { assets?: { id: string; name: string }[]; subfolders?: { id: string }[] }
-    const items: { id: string; name: string }[] = (data.assets ?? []).map((a) => ({ id: a.id, name: a.name }))
-    const subfolders = data.subfolders ?? []
-    for (const sub of subfolders) {
-      const nested = await collectAllAssetsRecursive(token, sub.id, shareSession)
-      items.push(...nested)
-    }
-    return items
-  } catch {
-    return []
-  }
-}
-
-async function handleDownloadAll(
-  token: string,
-  folderId: string | null,
-  shareSession?: string | null,
-) {
-  // Recursively collect all assets (including those in subfolders),
-  // pre-fetch presigned URLs in parallel, then trigger downloads
-  // sequentially with a delay so the browser doesn't block them. Same rule as
-  // bulk download on the project page: originals when the instance allows them,
-  // transcodes otherwise.
-  const allAssets = await collectAllAssetsRecursive(token, folderId, shareSession)
-  const urls = await Promise.all(
-    allAssets.map((a) => fetchDownloadUrl(token, a.id, shareSession, undefined, true)),
-  )
-  for (const url of urls) {
-    if (!url) continue
-    triggerDownload(url)
-    await new Promise((r) => setTimeout(r, 800))
-  }
-}
 
 // ─── Subfolder Card ───────────────────────────────────────────────────────────
 
@@ -574,6 +529,7 @@ interface AssetViewerProps {
   theme: 'dark' | 'light'
   projectLogoUrl: string | null
   onBack: () => void
+  navigation: ShareAssetNavigation
 }
 
 function HlsVideo({ src, className }: { src: string; className?: string }) {
@@ -606,7 +562,7 @@ function HlsVideo({ src, className }: { src: string; className?: string }) {
   return <video ref={videoRef} controls className={className} />
 }
 
-function AssetViewer({ token, shareSession, asset, permission, allowDownload, showVersions, theme, projectLogoUrl, onBack }: AssetViewerProps) {
+function AssetViewer({ token, shareSession, asset, permission, allowDownload, showVersions, theme, projectLogoUrl, onBack, navigation }: AssetViewerProps) {
   // Use the same ReviewProvider as the project review page, but with shareToken
   // This gives us the same video player, image viewer, comment panel, etc.
   return (
@@ -622,6 +578,7 @@ function AssetViewer({ token, shareSession, asset, permission, allowDownload, sh
         theme={theme}
         projectLogoUrl={projectLogoUrl}
         onBack={onBack}
+        navigation={navigation}
       />
     </div>
   )
@@ -675,6 +632,26 @@ export function FolderShareViewer({
   const [loading, setLoading] = React.useState(true)
   const [loadingMore, setLoadingMore] = React.useState(false)
   const [error, setError] = React.useState<string | null>(null)
+  const [navigationLoading, setNavigationLoading] = React.useState(false)
+  const [navigationError, setNavigationError] = React.useState<string | null>(null)
+  const [navigationAttempt, setNavigationAttempt] = React.useState(0)
+  const [archiveBusy, setArchiveBusy] = React.useState(false)
+  const [archiveStatus, setArchiveStatus] = React.useState<ShareArchiveStatus | null>(null)
+  const [archiveError, setArchiveError] = React.useState<string | null>(null)
+
+  async function downloadAll() {
+    if (archiveBusy || !allowDownload) return
+    setArchiveBusy(true)
+    setArchiveStatus(null)
+    setArchiveError(null)
+    try {
+      await downloadShareArchive(token, currentSubfolderId, shareSession, setArchiveStatus)
+    } catch (error) {
+      setArchiveError(error instanceof Error ? error.message : 'Could not download the ZIP. Please try again.')
+    } finally {
+      setArchiveBusy(false)
+    }
+  }
 
   const accentColor = appearance.accent_color ?? branding?.primary_color
   // No fallback: a link with no accent of its own, on an instance with no
@@ -727,6 +704,8 @@ export function FolderShareViewer({
     let cancelled = false
     setLoading(true)
     setError(null)
+    setNavigationError(null)
+    setNavigationLoading(false)
     setPage(1)
     setAssets([])
     setSubfolders([])
@@ -754,7 +733,7 @@ export function FolderShareViewer({
       })
 
     return () => { cancelled = true }
-  }, [token, currentSubfolderId])
+  }, [token, currentSubfolderId, sessionParam, perPage])
 
   async function loadMore() {
     const nextPage = page + 1
@@ -773,6 +752,53 @@ export function FolderShareViewer({
       setLoadingMore(false)
     }
   }
+
+  // Sorting/search apply to the entire folder before advancing. Otherwise an
+  // unloaded page could contain the next alphabetic/size match, or a search
+  // could incorrectly look finished while more matching assets exist.
+  const viewerOpen = viewingAsset !== null
+  React.useEffect(() => {
+    if (!viewerOpen || assets.length >= total) {
+      setNavigationLoading(false)
+      setNavigationError(null)
+      return
+    }
+    if (loadingMore) return
+    const controller = new AbortController()
+    setNavigationLoading(true)
+    setNavigationError(null)
+    async function completeFolder() {
+      const collected = new Map(assets.map((asset) => [asset.id, asset]))
+      let nextPage = page
+      let expectedTotal = total
+      try {
+        while (collected.size < expectedTotal) {
+          nextPage += 1
+          const response = await fetch(
+            `${API_URL}/share/${token}/assets?${currentSubfolderId ? `folder_id=${currentSubfolderId}&` : ''}page=${nextPage}&per_page=${perPage}${sessionParam}`,
+            { signal: controller.signal },
+          )
+          if (!response.ok) throw new Error('Unable to load more items')
+          const data = await response.json() as FolderShareAssetsResponse
+          if (controller.signal.aborted) return
+          const before = collected.size
+          for (const asset of data.assets ?? []) collected.set(asset.id, asset)
+          expectedTotal = data.total ?? expectedTotal
+          if (collected.size === before && collected.size < expectedTotal) throw new Error('Unable to load more items')
+        }
+        if (controller.signal.aborted) return
+        setAssets([...collected.values()])
+        setTotal(expectedTotal)
+        setPage(nextPage)
+      } catch {
+        if (!controller.signal.aborted) setNavigationError('Could not load items.')
+      } finally {
+        if (!controller.signal.aborted) setNavigationLoading(false)
+      }
+    }
+    void completeFolder()
+    return () => controller.abort()
+  }, [viewerOpen, loadingMore, assets, total, page, token, currentSubfolderId, perPage, sessionParam, navigationAttempt])
 
   function navigateToSubfolder(subfolder: FolderShareSubfolder) {
     setBreadcrumbs((prev) => [...prev, { id: subfolder.id, name: subfolder.name }])
@@ -830,8 +856,14 @@ export function FolderShareViewer({
 
   // Asset viewer overlay
   if (viewingAsset) {
+    const currentIndex = filteredAssets.findIndex((asset) => asset.id === viewingAsset.id)
+    const navigateAsset = (asset: FolderShareAssetItem) => {
+      useReviewStore.getState().reset()
+      setViewingAsset(asset)
+    }
     return (
       <AssetViewer
+        key={viewingAsset.id}
         token={token}
         shareSession={shareSession}
         asset={viewingAsset}
@@ -841,6 +873,15 @@ export function FolderShareViewer({
         theme={isDark ? 'dark' : 'light'}
         projectLogoUrl={branding?.logo_url ?? null}
         onBack={() => setViewingAsset(null)}
+        navigation={{
+          position: currentIndex + 1,
+          total: filteredAssets.length,
+          loading: navigationLoading || loadingMore || (assets.length < total && !navigationError),
+          error: navigationError,
+          onPrevious: currentIndex > 0 ? () => navigateAsset(filteredAssets[currentIndex - 1]) : undefined,
+          onNext: currentIndex >= 0 && currentIndex < filteredAssets.length - 1 ? () => navigateAsset(filteredAssets[currentIndex + 1]) : undefined,
+          onRetry: () => setNavigationAttempt((attempt) => attempt + 1),
+        }}
       />
     )
   }
@@ -918,11 +959,13 @@ export function FolderShareViewer({
         <div className="flex items-center gap-2 shrink-0">
           {allowDownload && (
             <button
-              className="flex items-center gap-1.5 h-7 px-3 rounded-md text-xs font-medium text-white bg-accent hover:bg-accent-hover transition-colors"
-              onClick={() => handleDownloadAll(token, currentSubfolderId ?? null, shareSession)}
+              className="flex items-center gap-1.5 h-7 px-3 rounded-md text-xs font-medium text-white bg-accent hover:bg-accent-hover transition-colors disabled:opacity-60 disabled:cursor-wait"
+              onClick={downloadAll}
+              disabled={archiveBusy}
+              title="Download all files in this folder as one ZIP"
             >
-              <Download className="h-3 w-3" />
-              Download All
+              {archiveBusy ? <Loader2 className="h-3 w-3 animate-spin" /> : <Download className="h-3 w-3" />}
+              {archiveBusy ? 'Downloading ZIP…' : 'Download All'}
             </button>
           )}
           <button
@@ -934,6 +977,16 @@ export function FolderShareViewer({
           </button>
         </div>
       </header>
+
+      {(archiveBusy || archiveStatus || archiveError) && (
+        <div role={archiveError ? 'alert' : 'status'} className={cn('border-b border-border px-5 py-2 text-sm', archiveError ? 'text-red-400' : 'text-text-secondary')}>
+          {archiveError || (archiveStatus?.status === 'complete'
+            ? 'ZIP sent to your browser. Check Downloads to confirm it was saved.'
+            : archiveStatus?.status === 'downloading'
+              ? `Sending ZIP: ${archiveStatus.completed_files} of ${archiveStatus.file_count} files. Keep this page open for download updates.`
+              : 'Preparing your ZIP download…')}
+        </div>
+      )}
 
       {/* ─── Content area ──────────────────────────────────────────────── */}
       <div className="relative flex flex-1 overflow-hidden">

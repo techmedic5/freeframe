@@ -11,7 +11,7 @@
  * (#117, #123).
  */
 import * as React from 'react'
-import { ArrowLeft, ChevronDown, Download, Loader2, PanelRightClose, PanelRightOpen } from 'lucide-react'
+import { ArrowLeft, ChevronDown, ChevronLeft, ChevronRight, Download, Loader2, PanelRightClose, PanelRightOpen } from 'lucide-react'
 import { useReview, type CreateCommentPayload } from '@/components/review/review-provider'
 import { useReviewStore } from '@/stores/review-store'
 import { MobileCommentSheet, PEEK_PX, type SheetState } from '@/components/review/mobile-comment-sheet'
@@ -22,6 +22,17 @@ import type { SharePermission } from '@/types'
 import { fetchShareDownloadOptions, handleDownload } from './share-download'
 import { DownloadMenu } from '@/components/shared/download-menu'
 import { ShareBrandMark } from './share-brand-mark'
+import { useAssetSwipe } from '@/hooks/use-asset-swipe'
+
+export interface ShareAssetNavigation {
+  position: number
+  total: number
+  loading: boolean
+  error: string | null
+  onPrevious?: () => void
+  onNext?: () => void
+  onRetry: () => void
+}
 
 /** Signed in, or a guest who has already given a name and email. */
 function hasIdentity(): boolean {
@@ -33,7 +44,7 @@ function hasIdentity(): boolean {
 }
 
 export function ShareReviewScreen({
-  token, shareSession, assetId, assetName, permission, allowDownload, showVersions, theme = 'dark', projectLogoUrl, onBack,
+  token, shareSession, assetId, assetName, permission, allowDownload, showVersions, theme = 'dark', projectLogoUrl, onBack, navigation,
 }: {
   token: string; shareSession?: string | null; assetId: string; assetName: string; permission: SharePermission; allowDownload: boolean; showVersions: boolean
   /** The link's theme, which the page renders in; picks the logo variant. Dark, the share pages' default, when not given. */
@@ -41,6 +52,7 @@ export function ShareReviewScreen({
   /** The project's logo from the link's branding, shown ahead of the instance's. */
   projectLogoUrl?: string | null
   onBack?: () => void
+  navigation?: ShareAssetNavigation
 }) {
   const [ReviewProvider, setProvider] = React.useState<any>(null)
   const [VideoPlayer, setVideoPlayer] = React.useState<any>(null)
@@ -89,6 +101,7 @@ export function ShareReviewScreen({
         theme={theme}
         projectLogoUrl={projectLogoUrl}
         onBack={onBack}
+        navigation={navigation}
         VideoPlayer={VideoPlayer}
         ImageViewer={ImageViewer}
         AudioPlayer={AudioPlayer}
@@ -101,7 +114,7 @@ export function ShareReviewScreen({
 }
 
 function ShareReviewInner({
-  token, shareSession, assetName, permission, allowDownload, showVersions, theme, projectLogoUrl, onBack,
+  token, shareSession, assetName, permission, allowDownload, showVersions, theme, projectLogoUrl, onBack, navigation,
   VideoPlayer, ImageViewer, AudioPlayer, CommentPanel, CommentInput, VersionSwitcher,
 }: any) {
   const { asset, versions, isLoading, comments, refetchComments, addComment, togglePlayback } = useReview()
@@ -126,6 +139,15 @@ function ShareReviewInner({
   const { isPlaying, togglePlay, mediaRootRef } = useMediaTransport({ toggleVideo: togglePlayback })
   const reviewRootRef = React.useRef<HTMLDivElement>(null)
   const handleSheetHeight = React.useCallback((px: number) => setSheetHeight(px), [])
+  const navigationBlocked = isDrawingMode || navigation?.loading || !!navigation?.error
+  const previousAsset = navigationBlocked ? undefined : navigation?.onPrevious
+  const nextAsset = navigationBlocked ? undefined : navigation?.onNext
+  const mediaSwipe = useAssetSwipe({
+    onPrevious: previousAsset,
+    onNext: nextAsset,
+    canSwipe: () => !navigationBlocked && asset?.asset_type === 'video',
+    canStart: (target) => target.tagName === 'VIDEO',
+  })
 
   // Drawing collapses the sheet to `compose`, which drops the comment list and
   // leaves only the composer and the drawing toolbar. Someone marking up a
@@ -298,7 +320,7 @@ function ShareReviewInner({
           {/* A single-asset link has no grid to go back to, so there is nothing
               for this to do there. */}
           {onBack && (
-            <button onClick={onBack} className="flex items-center justify-center h-7 w-7 rounded-md text-text-secondary hover:text-text-primary hover:bg-bg-hover transition-colors shrink-0">
+            <button onClick={onBack} aria-label="Back to gallery" className="flex items-center justify-center h-7 w-7 rounded-md text-text-secondary hover:text-text-primary hover:bg-bg-hover transition-colors shrink-0">
               <ArrowLeft className="h-4 w-4" />
             </button>
           )}
@@ -328,6 +350,24 @@ function ShareReviewInner({
         </div>
       </div>
 
+      {navigation && (
+        <nav aria-label="Media navigation" className="flex shrink-0 items-center justify-between gap-2 border-b border-border px-3 bg-bg-secondary">
+          <button type="button" onClick={previousAsset} disabled={!previousAsset} aria-label="Previous asset" className="flex h-11 items-center gap-1 px-2 text-sm text-text-secondary hover:text-text-primary disabled:opacity-40 disabled:cursor-not-allowed">
+            <ChevronLeft className="h-4 w-4" /> Previous
+          </button>
+          <div className="min-w-0 text-center text-xs text-text-tertiary" aria-live="polite">
+            {navigation.error ? (
+              <span role="alert">{navigation.error} <button type="button" onClick={navigation.onRetry} className="underline h-11 px-1">Retry</button></span>
+            ) : navigation.loading ? (
+              <span className="inline-flex items-center gap-1"><Loader2 className="h-3 w-3 animate-spin" /> Loading items…</span>
+            ) : `${navigation.position} of ${navigation.total}`}
+          </div>
+          <button type="button" onClick={nextAsset} disabled={!nextAsset} aria-label="Next asset" className="flex h-11 items-center gap-1 px-2 text-sm text-text-secondary hover:text-text-primary disabled:opacity-40 disabled:cursor-not-allowed">
+            Next <ChevronRight className="h-4 w-4" />
+          </button>
+        </nav>
+      )}
+
       {/* Main: viewer + sidebar */}
       {/* pb-14 reserves the sheet's peek band so the player's own transport
           row stays on screen and tappable underneath it. */}
@@ -339,6 +379,7 @@ function ShareReviewInner({
         <div
           ref={mediaRootRef}
           className="flex-1 flex flex-col bg-bg-primary overflow-hidden min-w-0"
+          {...mediaSwipe}
         >
           {asset.asset_type === 'video' && versionReady && VideoPlayer ? (
             <VideoPlayer
@@ -360,6 +401,8 @@ function ShareReviewInner({
               <ImageViewer
                 asset={asset}
                 version={currentVersion}
+                onPreviousAsset={previousAsset}
+                onNextAsset={nextAsset}
                 annotationCanvas={
                   <>
                     {AnnotationOverlay && <AnnotationOverlay key={focusedCommentId ?? 'none'} />}

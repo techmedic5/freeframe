@@ -1,6 +1,7 @@
 'use client'
 
 import * as React from 'react'
+import { useAssetSwipe } from '@/hooks/use-asset-swipe'
 import Image from 'next/image'
 import {
   TransformWrapper,
@@ -138,9 +139,11 @@ interface ImageViewerProps {
   className?: string
   /** Optional: rendered on top of the image for annotations */
   annotationCanvas?: React.ReactNode
+  onPreviousAsset?: () => void
+  onNextAsset?: () => void
 }
 
-export function ImageViewer({ asset, version, className, annotationCanvas }: ImageViewerProps) {
+export function ImageViewer({ asset, version, className, annotationCanvas, onPreviousAsset, onNextAsset }: ImageViewerProps) {
   const { isDrawingMode, setFocusedCommentId, setActiveAnnotation } = useReviewStore()
 
   const handleImageClick = () => {
@@ -173,6 +176,12 @@ export function ImageViewer({ asset, version, className, annotationCanvas }: Ima
 
   const isCarousel = asset.asset_type === 'image_carousel'
   const totalImages = isCarousel ? mediaFiles.length : 1
+  const zoomScale = React.useRef(1)
+  const swipe = useAssetSwipe({
+    onPrevious: onPreviousAsset,
+    onNext: onNextAsset,
+    canSwipe: () => !isDrawingMode && !isCarousel && Math.abs(zoomScale.current - 1) < 0.01,
+  })
 
   // Access share context for share-mode stream fetching
   let shareToken: string | undefined
@@ -288,7 +297,7 @@ export function ImageViewer({ asset, version, className, annotationCanvas }: Ima
   return (
     <div className={cn('relative flex h-full w-full flex-col overflow-hidden bg-bg-primary', className)}>
       {/* Zoom/pan area — click to deselect comment & hide annotation */}
-      <div className="relative flex-1 overflow-hidden" onClick={handleImageClick}>
+      <div className="relative flex-1 overflow-hidden" onClick={handleImageClick} {...swipe}>
         <TransformWrapper
           key={currentUrl}
           initialScale={1}
@@ -298,6 +307,8 @@ export function ImageViewer({ asset, version, className, annotationCanvas }: Ima
           wheel={{ step: 0.08 }}
           pinch={{ step: 5 }}
           disabled={isDrawingMode}
+          onInit={() => { zoomScale.current = 1 }}
+          onTransformed={(_, state) => { zoomScale.current = state.scale }}
         >
           {() => (
             <>
