@@ -58,7 +58,15 @@ Releases before v1.21.0 have no images.
      which would move the `latest` branch to the backport: delete that file
      on the branch before tagging.
    - If an image fails to build, `latest` (branch and image tag) stays where
-     it was; fix the cause and re-run the workflow as below.
+     it was. For a transient failure (a registry or network error), open the
+     release's own "Publish images" run under Actions and use **Re-run failed
+     jobs**. Do not start a new run with "Run workflow" for this: a
+     workflow_dispatch run registers its check-runs on main's HEAD, not on the
+     tag's commit, so the original run's failed check-runs stay on the tag
+     commit and "Promote release to stable" refuses the tag. If the original
+     run cannot succeed when re-run, publish with "Run workflow" (below) and
+     promote that tag with `force: true` once you have checked that its CI run
+     passed (`force` skips the whole CI gate).
 
 ## Rebuilding or backfilling images
 
@@ -66,8 +74,9 @@ Run the **"Publish images"** workflow (Actions, Run workflow) with
 `tag: vX.Y.Z`. It builds that tag's commit and overwrites the version's own
 tags. `X.Y`, `latest` and `stable` move to the rebuilt image only where they
 still pointed at that version's previous image, so a rebuild never takes them
-from a newer release. Use it to publish a release whose run failed, or to pick
-up a base-image security fix.
+from a newer release. Use it to backfill a release that has no images, or to
+pick up a base-image security fix. For a release whose own run failed, re-run
+that run's failed jobs instead (see "Cutting a release").
 
 Check where an image came from with:
 
@@ -105,15 +114,20 @@ release (soak it as `latest`, smoke-test, watch for breakage reports).
 - Optionally edit the bad GitHub Release to mark it clearly broken. The
   immutable `vX.Y.Z` tag stays as-is; only the `stable` pointer retreats.
 
+## One-time setup still to do
+
+- Each GHCR package (`freeframe-api`, `freeframe-web`) has to be made public
+  by hand once, after its first push (org Packages, the package, Package
+  settings, Change visibility). GitHub creates a package as private and has no
+  API to change that; until then an anonymous `docker pull` fails, and so do
+  the published-images compose files and the installer. Do it before the
+  first release that the docs point people at.
+
 ## One-time setup (already done)
 
 - `stable` and `latest` branches were created at **v1.3.1**.
 - `latest`/`stable` must **not** have required-review branch protection, or the
   workflows' `GITHUB_TOKEN` (`contents: write`) can't push them. Only `main` is
   protected.
-- Each GHCR package (`freeframe-api`, `freeframe-web`) has to be made public
-  by hand once, after its first push (org Packages, the package, Package
-  settings, Change visibility). GitHub creates a package as private and has no
-  API to change that; until then an anonymous `docker pull` fails.
 - Moving `latest`/`stable` does **not** run `ci.yml` (it triggers on
   `push: branches: [main]` only), so there's no CI storm and no trigger loop.
