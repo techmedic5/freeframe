@@ -1,3 +1,4 @@
+import logging
 import threading
 from typing import Optional
 from urllib.parse import quote
@@ -19,6 +20,7 @@ from ..services.permissions import validate_share_link_with_session
 from ..services.share_archives import prepare_archive, load_job, public_status, stream_archive, fail_job
 
 router = APIRouter(tags=["sharing"])
+logger = logging.getLogger(__name__)
 
 
 class ArchiveRequest(BaseModel):
@@ -71,8 +73,9 @@ def prepare_share_archive(
         return public_status(prepare_archive(db, token, share_session, current_user, body.folder_id))
     except HTTPException:
         raise
-    except Exception:
-        raise HTTPException(503, "Could not prepare the ZIP; please try again")
+    except Exception as exc:
+        logger.exception("Could not prepare guest ZIP download")
+        raise HTTPException(503, "Could not prepare the ZIP; please try again") from exc
 
 
 @router.get("/share/{token}/archives/{job_id}")
@@ -101,11 +104,13 @@ def download_share_archive(
         stream = stream_archive(db, job, token, share_session, user)
         first = next(stream)
     except Exception as exc:
+        if not isinstance(exc, HTTPException):
+            logger.exception("Could not start guest ZIP download")
         if job["status"] == "downloading" or not isinstance(exc, HTTPException) or exc.status_code != 409:
             fail_job(job, exc.detail if isinstance(exc, HTTPException) else "ZIP download could not start; please try again")
         if isinstance(exc, HTTPException):
             raise
-        raise HTTPException(503, job["error"])
+        raise HTTPException(503, job["error"]) from exc
     return ArchiveResponse(
         first, stream, media_type="application/zip",
         headers={"Content-Disposition": "attachment; filename=\"download.zip\"; filename*=UTF-8''" + quote(job["filename"]),
