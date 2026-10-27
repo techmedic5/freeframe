@@ -27,7 +27,7 @@ import { useReviewStore } from '@/stores/review-store'
 import { fetchDownloadUrl, fetchShareDownloadOptions, handleDownload, triggerDownload } from './share-download'
 import { DownloadMenu } from '@/components/shared/download-menu'
 import { CommentCountBadge } from '@/components/shared/comment-count-badge'
-import { ShareReviewScreen } from './share-review-screen'
+import { ShareReviewScreen, type ShareAssetNavigation } from './share-review-screen'
 import { ShareBrandMark } from './share-brand-mark'
 import { usePageTitle } from '@/hooks/use-page-title'
 import { SHARE_ASSETS_PAGE_SIZE } from '@/lib/share-page'
@@ -574,6 +574,7 @@ interface AssetViewerProps {
   theme: 'dark' | 'light'
   projectLogoUrl: string | null
   onBack: () => void
+  navigation: ShareAssetNavigation
 }
 
 function HlsVideo({ src, className }: { src: string; className?: string }) {
@@ -606,7 +607,7 @@ function HlsVideo({ src, className }: { src: string; className?: string }) {
   return <video ref={videoRef} controls className={className} />
 }
 
-function AssetViewer({ token, shareSession, asset, permission, allowDownload, showVersions, theme, projectLogoUrl, onBack }: AssetViewerProps) {
+function AssetViewer({ token, shareSession, asset, permission, allowDownload, showVersions, theme, projectLogoUrl, onBack, navigation }: AssetViewerProps) {
   // Use the same ReviewProvider as the project review page, but with shareToken
   // This gives us the same video player, image viewer, comment panel, etc.
   return (
@@ -622,6 +623,7 @@ function AssetViewer({ token, shareSession, asset, permission, allowDownload, sh
         theme={theme}
         projectLogoUrl={projectLogoUrl}
         onBack={onBack}
+        navigation={navigation}
       />
     </div>
   )
@@ -675,6 +677,9 @@ export function FolderShareViewer({
   const [loading, setLoading] = React.useState(true)
   const [loadingMore, setLoadingMore] = React.useState(false)
   const [error, setError] = React.useState<string | null>(null)
+  const [navigationLoading, setNavigationLoading] = React.useState(false)
+  const [navigationError, setNavigationError] = React.useState<string | null>(null)
+  const [navigationAttempt, setNavigationAttempt] = React.useState(0)
 
   const accentColor = appearance.accent_color ?? branding?.primary_color
   // No fallback: a link with no accent of its own, on an instance with no
@@ -727,6 +732,8 @@ export function FolderShareViewer({
     let cancelled = false
     setLoading(true)
     setError(null)
+    setNavigationError(null)
+    setNavigationLoading(false)
     setPage(1)
     setAssets([])
     setSubfolders([])
@@ -754,7 +761,7 @@ export function FolderShareViewer({
       })
 
     return () => { cancelled = true }
-  }, [token, currentSubfolderId])
+  }, [token, currentSubfolderId, sessionParam, perPage])
 
   async function loadMore() {
     const nextPage = page + 1
@@ -773,6 +780,53 @@ export function FolderShareViewer({
       setLoadingMore(false)
     }
   }
+
+  // Sorting/search apply to the entire folder before advancing. Otherwise an
+  // unloaded page could contain the next alphabetic/size match, or a search
+  // could incorrectly look finished while more matching assets exist.
+  const viewerOpen = viewingAsset !== null
+  React.useEffect(() => {
+    if (!viewerOpen || assets.length >= total) {
+      setNavigationLoading(false)
+      setNavigationError(null)
+      return
+    }
+    if (loadingMore) return
+    const controller = new AbortController()
+    setNavigationLoading(true)
+    setNavigationError(null)
+    async function completeFolder() {
+      const collected = new Map(assets.map((asset) => [asset.id, asset]))
+      let nextPage = page
+      let expectedTotal = total
+      try {
+        while (collected.size < expectedTotal) {
+          nextPage += 1
+          const response = await fetch(
+            `${API_URL}/share/${token}/assets?${currentSubfolderId ? `folder_id=${currentSubfolderId}&` : ''}page=${nextPage}&per_page=${perPage}${sessionParam}`,
+            { signal: controller.signal },
+          )
+          if (!response.ok) throw new Error('Unable to load more items')
+          const data = await response.json() as FolderShareAssetsResponse
+          if (controller.signal.aborted) return
+          const before = collected.size
+          for (const asset of data.assets ?? []) collected.set(asset.id, asset)
+          expectedTotal = data.total ?? expectedTotal
+          if (collected.size === before && collected.size < expectedTotal) throw new Error('Unable to load more items')
+        }
+        if (controller.signal.aborted) return
+        setAssets([...collected.values()])
+        setTotal(expectedTotal)
+        setPage(nextPage)
+      } catch {
+        if (!controller.signal.aborted) setNavigationError('Could not load items.')
+      } finally {
+        if (!controller.signal.aborted) setNavigationLoading(false)
+      }
+    }
+    void completeFolder()
+    return () => controller.abort()
+  }, [viewerOpen, loadingMore, assets, total, page, token, currentSubfolderId, perPage, sessionParam, navigationAttempt])
 
   function navigateToSubfolder(subfolder: FolderShareSubfolder) {
     setBreadcrumbs((prev) => [...prev, { id: subfolder.id, name: subfolder.name }])
@@ -830,8 +884,14 @@ export function FolderShareViewer({
 
   // Asset viewer overlay
   if (viewingAsset) {
+    const currentIndex = filteredAssets.findIndex((asset) => asset.id === viewingAsset.id)
+    const navigateAsset = (asset: FolderShareAssetItem) => {
+      useReviewStore.getState().reset()
+      setViewingAsset(asset)
+    }
     return (
       <AssetViewer
+        key={viewingAsset.id}
         token={token}
         shareSession={shareSession}
         asset={viewingAsset}
@@ -841,6 +901,15 @@ export function FolderShareViewer({
         theme={isDark ? 'dark' : 'light'}
         projectLogoUrl={branding?.logo_url ?? null}
         onBack={() => setViewingAsset(null)}
+        navigation={{
+          position: currentIndex + 1,
+          total: filteredAssets.length,
+          loading: navigationLoading || loadingMore || (assets.length < total && !navigationError),
+          error: navigationError,
+          onPrevious: currentIndex > 0 ? () => navigateAsset(filteredAssets[currentIndex - 1]) : undefined,
+          onNext: currentIndex >= 0 && currentIndex < filteredAssets.length - 1 ? () => navigateAsset(filteredAssets[currentIndex + 1]) : undefined,
+          onRetry: () => setNavigationAttempt((attempt) => attempt + 1),
+        }}
       />
     )
   }
